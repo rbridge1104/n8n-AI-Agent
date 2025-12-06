@@ -21,12 +21,23 @@ def load_env():
     """Load environment variables from .env file"""
     load_dotenv()
 
-    required_vars = ['N8N_URL', 'N8N_API_KEY', 'OLLAMA_URL', 'OLLAMA_MODEL']
+    # Required n8n credentials
+    required_vars = ['N8N_URL', 'N8N_API_KEY']
     missing = [var for var in required_vars if not os.getenv(var)]
 
     if missing:
         console.print(f"[red]Error: Missing required environment variables: {', '.join(missing)}[/red]")
         console.print("[yellow]Copy .env.example to .env and fill in your credentials[/yellow]")
+        sys.exit(1)
+
+    # At least one AI service required (Ollama or Groq)
+    has_ollama = os.getenv('OLLAMA_URL') and os.getenv('OLLAMA_MODEL')
+    has_groq = os.getenv('GROQ_API_KEY')
+
+    if not has_ollama and not has_groq:
+        console.print("[red]Error: At least one AI service must be configured:[/red]")
+        console.print("[yellow]  - Ollama (OLLAMA_URL + OLLAMA_MODEL), or[/yellow]")
+        console.print("[yellow]  - Groq (GROQ_API_KEY)[/yellow]")
         sys.exit(1)
 
 
@@ -129,7 +140,7 @@ def time_ago(timestamp_str):
 
 
 def ask_ollama(workflow, health):
-    """Ask Ollama for improvement suggestion"""
+    """Ask Ollama (or Groq fallback) for improvement suggestion"""
     active_status = "active" if workflow.get('active') else "inactive"
 
     prompt = f"""This is an n8n automation workflow called '{workflow['name']}'.
@@ -142,20 +153,47 @@ Be practical and concise (2-3 sentences max).
 
 Workflow JSON: {json.dumps(workflow.get('nodes', [])[:3])}"""
 
-    base_url = os.getenv('OLLAMA_URL').rstrip('/')
-    url = f"{base_url}/api/generate"
-    payload = {
-        "model": os.getenv('OLLAMA_MODEL'),
-        "prompt": prompt,
-        "stream": False
-    }
+    # Try Ollama first
+    ollama_url = os.getenv('OLLAMA_URL')
+    if ollama_url:
+        try:
+            base_url = ollama_url.rstrip('/')
+            url = f"{base_url}/api/generate"
+            payload = {
+                "model": os.getenv('OLLAMA_MODEL'),
+                "prompt": prompt,
+                "stream": False
+            }
+            response = requests.post(url, json=payload, timeout=30)
+            response.raise_for_status()
+            return response.json().get('response', 'Unable to generate suggestion')
+        except requests.RequestException:
+            pass  # Fall through to Groq
 
-    try:
-        response = requests.post(url, json=payload, timeout=30)
-        response.raise_for_status()
-        return response.json().get('response', 'Unable to generate suggestion')
-    except requests.RequestException:
-        return "Unable to connect to Ollama"
+    # Fallback to Groq if Ollama fails or not configured
+    groq_api_key = os.getenv('GROQ_API_KEY')
+    if groq_api_key:
+        try:
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {groq_api_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile'),
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.7,
+                "max_tokens": 200
+            }
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            response.raise_for_status()
+            return response.json()['choices'][0]['message']['content']
+        except requests.RequestException:
+            pass  # Both failed
+
+    return "Unable to connect to AI service (tried Ollama and Groq)"
 
 
 def get_status_icon(workflow, health):
