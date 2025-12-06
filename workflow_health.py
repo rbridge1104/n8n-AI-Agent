@@ -118,6 +118,21 @@ def update_workflow(workflow_id, workflow_data):
                         cleaned_creds[cred_type] = cred_data
                 node['credentials'] = cleaned_creds
 
+    # Debug: Show what we're sending (temporarily)
+    console.print("[dim]Debug: Sending fields to n8n API:[/dim]", style="dim")
+    console.print(f"[dim]  - Fields: {list(clean_data.keys())}[/dim]", style="dim")
+    if 'nodes' in clean_data and len(clean_data['nodes']) > 0:
+        sample_node = clean_data['nodes'][0]
+        console.print(f"[dim]  - Sample node fields: {list(sample_node.keys())}[/dim]", style="dim")
+
+    # Save to file for inspection
+    try:
+        with open('debug_workflow_update.json', 'w') as f:
+            json.dump(clean_data, f, indent=2)
+        console.print("[dim]  - Full data saved to debug_workflow_update.json[/dim]", style="dim")
+    except:
+        pass
+
     try:
         response = requests.put(url, headers=headers, json=clean_data, timeout=30)
         response.raise_for_status()
