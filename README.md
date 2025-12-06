@@ -7,7 +7,8 @@ A Python CLI tool that monitors your n8n workflows and provides AI-powered impro
 - 📊 Check health status of all your n8n workflows
 - ✅ Calculate success rates from recent executions
 - ⏰ Track when workflows last ran
-- 🤖 Get AI-powered improvement suggestions via Ollama
+- 🤖 Get AI-powered improvement suggestions via Ollama or Groq
+- 🔧 **Automatically implement fixes with user authorization**
 - 🎨 Beautiful terminal output with Rich library
 - 🔒 Secure credential management with `.env` files
 
@@ -94,13 +95,56 @@ Summary: 2 workflows checked
 ## How It Works
 
 1. **Fetches workflows** from your n8n instance via API
-2. **Retrieves execution history** (last 10 runs per workflow)
+2. **Retrieves execution history** (last 20 runs per workflow)
 3. **Calculates health metrics**:
    - Active/Inactive status
    - Success rate percentage
    - Last successful run time
-4. **Asks Ollama** for improvement suggestions based on workflow health
-5. **Displays results** in a beautiful, color-coded format
+   - Error messages from failed executions
+4. **Asks AI (Ollama/Groq)** for comprehensive analysis including:
+   - Root cause analysis
+   - Quick fix suggestions
+   - Structured implementation plan
+5. **Prompts for fix authorization** if a workflow needs attention
+6. **Automatically applies fixes** when you approve them
+7. **Displays results** in a beautiful, color-coded format
+
+## Automatic Fix Implementation
+
+When the AI detects issues with your workflows, it can now automatically fix them! The tool supports:
+
+- **ADD_RETRY**: Add retry logic to failing nodes (configurable retries and delays)
+- **UPDATE_NODE**: Modify node parameters (timeouts, credentials, settings)
+- **FIX_SETTINGS**: Update workflow-level settings
+- **ADD_ERROR_HANDLING**: Add error trigger nodes for better error management
+- **ADD_NODE**: Insert new nodes into the workflow
+
+### Fix Workflow
+
+1. The AI analyzes your workflow and suggests a fix
+2. You see exactly what changes will be made
+3. You approve or decline the fix
+4. If approved, the fix is applied to your n8n workflow automatically
+5. You get immediate confirmation of success or error details
+
+### Example
+
+```
+╭──────────────────────────────────────────╮
+│ Fix Available for: Email Alerts Workflow│
+╰──────────────────────────────────────────╯
+
+Suggested Fix: Add retry logic to the Gmail node to handle temporary connection failures
+
+Changes to be applied:
+  • Add retry logic to node: Gmail
+    - Max retries: 3
+    - Wait between retries: 1000ms
+
+Apply this fix? (yes/no): yes
+Applying fix...
+✓ Fix applied successfully!
+```
 
 ## Configuration
 
