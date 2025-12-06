@@ -1,0 +1,393 @@
+{
+  "name": "Email Action Detector - Simple",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyX",
+              "value": 5,
+              "unit": "minutes"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {},
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        0,
+        -104
+      ],
+      "name": "Gmail Trigger",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "5WJSSZe2zFVcYEgD",
+          "name": "Gmail account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Master Email Categorizer - Tasks, Meetings, Junk, Important\nconst items = $input.all();\nconst results = [];\n\n// ========== TASK KEYWORDS ==========\nconst TASK_KEYWORDS = [\n  'review', 'follow up', 'deadline', 'due', 'action needed',\n  'please', 'can you', 'could you', 'would you', 'todo', 'task',\n  'complete', 'finish', 'prepare', 'send', 'submit', 'check',\n  'need you to', 'need to', 'should', 'must', 'have to'\n];\n\n// ========== MEETING KEYWORDS ==========\nconst MEETING_KEYWORDS = [\n  'meeting', 'call', 'schedule', 'appointment',\n  'zoom', 'teams', 'meet', 'calendar', 'lets meet',\n  'sync up', 'sync', 'catchup', 'catch up', 'discuss',\n  'conference', 'video call', 'phone call', 'join us'\n];\n\n// ========== JUNK DETECTION PATTERNS ==========\nconst JUNK_PATTERNS = {\n  newsletter: {\n    keywords: ['newsletter', 'digest', 'weekly', 'monthly', 'roundup', 'bulletin'],\n    confidence: 0.9,\n    category: 'Newsletter/Marketing'\n  },\n  marketing: {\n    keywords: ['unsubscribe', 'promotional', 'special offer', 'discount', 'sale', 'deal', 'limited time'],\n    confidence: 0.85,\n    category: 'Newsletter/Marketing'\n  },\n  notifications: {\n    keywords: ['notification', 'alert', 'reminder', 'update available'],\n    fromPatterns: ['noreply@', 'no-reply@', 'notifications@', 'donotreply@', 'do-not-reply@'],\n    confidence: 0.8,\n    category: 'Automated Notifications'\n  },\n  social: {\n    domains: ['facebook', 'twitter', 'linkedin', 'instagram', 'tiktok', 'pinterest', 'reddit'],\n    keywords: ['liked your', 'commented on', 'shared your', 'mentioned you', 'friend request', 'connection request'],\n    confidence: 0.9,\n    category: 'Social Media'\n  },\n  sales: {\n    keywords: ['partnership opportunity', 'collaboration', 'reaching out', 'quick question', \n               'wanted to connect', 'introduction', 'explore opportunities', 'quick call',\n               'saw your profile', 'noticed you'],\n    confidence: 0.75,\n    category: 'Sales/Cold Emails'\n  },\n  receipts: {\n    keywords: ['receipt', 'order confirmation', 'shipping', 'invoice', 'payment received', \n               'purchase confirmation', 'order #', 'tracking number', 'shipped', 'delivery'],\n    fromPatterns: ['orders@', 'receipts@', 'billing@', 'invoice@', 'shipping@'],\n    confidence: 0.95,\n    category: 'Receipts/Confirmations'\n  }\n};\n\nconst MARKETING_DOMAINS = [\n  'mailchimp', 'sendgrid', 'constantcontact', 'aweber', 'getresponse',\n  'campaignmonitor', 'mailgun', 'sendinblue', 'activecampaign'\n];\n\n// ========== HELPER FUNCTIONS ==========\nfunction containsKeywords(text, keywords) {\n  if (!keywords) return [];\n  const lowerText = text.toLowerCase();\n  return keywords.filter(kw => lowerText.includes(kw.toLowerCase()));\n}\n\nfunction matchesFromPattern(from, patterns) {\n  if (!patterns) return false;\n  const lowerFrom = from.toLowerCase();\n  return patterns.some(pattern => lowerFrom.includes(pattern.toLowerCase()));\n}\n\nfunction isMarketingDomain(from) {\n  const lowerFrom = from.toLowerCase();\n  return MARKETING_DOMAINS.some(domain => lowerFrom.includes(domain));\n}\n\n// ========== PROCESS EMAILS ==========\nfor (const item of items) {\n  // Extract email data\n  const emailId = item.json.id;\n  const threadId = item.json.threadId;\n  const headers = item.json.headers || {};\n  const labelIds = item.json.labelIds || [];\n  \n  let subject = '';\n  let from = '';\n  let date = '';\n  let hasUnsubscribe = false;\n  \n  // Parse headers\n  for (const [key, value] of Object.entries(headers)) {\n    const lowerKey = key.toLowerCase();\n    if (lowerKey === 'subject') {\n      subject = value.replace('Subject: ', '');\n    }\n    if (lowerKey === 'from') {\n      from = value.replace('From: ', '');\n    }\n    if (lowerKey === 'date') {\n      date = value.replace('Date: ', '');\n    }\n    if (lowerKey === 'list-unsubscribe' || value.toLowerCase().includes('unsubscribe')) {\n      hasUnsubscribe = true;\n    }\n  }\n  \n  // Get body text\n  const snippet = item.json.snippet || '';\n  const textPlain = item.json.textPlain || '';\n  const textHtml = item.json.textHtml || '';\n  \n  let bodyText = snippet;\n  if (textPlain.length > bodyText.length) bodyText = textPlain;\n  if (textHtml.length > bodyText.length) {\n    bodyText = textHtml.replace(/<[^>]*>/g, ' ');\n  }\n  \n  const fullText = `${subject} ${bodyText}`.toLowerCase();\n  \n  // Skip if no content\n  if (!fullText.trim()) continue;\n  \n  // ========== CATEGORIZATION LOGIC ==========\n  \n  // 1. CHECK FOR JUNK FIRST (highest priority to filter out noise)\n  let isJunk = false;\n  let junkCategory = '';\n  let junkConfidence = 0;\n  let junkReasons = [];\n  \n  // Check Gmail categories\n  if (labelIds.includes('CATEGORY_PROMOTIONS')) {\n    isJunk = true;\n    junkConfidence = 0.9;\n    junkCategory = 'Newsletter/Marketing';\n    junkReasons.push('Gmail category: PROMOTIONS');\n  }\n  \n  if (labelIds.includes('CATEGORY_UPDATES')) {\n    isJunk = true;\n    junkConfidence = Math.max(junkConfidence, 0.85);\n    junkCategory = junkCategory || 'Automated Notifications';\n    junkReasons.push('Gmail category: UPDATES');\n  }\n  \n  if (labelIds.includes('CATEGORY_SOCIAL')) {\n    isJunk = true;\n    junkConfidence = Math.max(junkConfidence, 0.9);\n    junkCategory = 'Social Media';\n    junkReasons.push('Gmail category: SOCIAL');\n  }\n  \n  // Check junk patterns\n  for (const [type, pattern] of Object.entries(JUNK_PATTERNS)) {\n    let matched = false;\n    \n    if (pattern.keywords) {\n      const matches = containsKeywords(fullText, pattern.keywords);\n      if (matches.length > 0) {\n        matched = true;\n        junkReasons.push(`Contains ${type} keywords: ${matches.join(', ')}`);\n      }\n    }\n    \n    if (pattern.fromPatterns && matchesFromPattern(from, pattern.fromPatterns)) {\n      matched = true;\n      junkReasons.push(`From ${type} address pattern`);\n    }\n    \n    if (pattern.domains && pattern.domains.some(d => from.toLowerCase().includes(d))) {\n      matched = true;\n      junkReasons.push(`From ${type} domain`);\n    }\n    \n    if (matched) {\n      isJunk = true;\n      junkConfidence = Math.max(junkConfidence, pattern.confidence);\n      junkCategory = junkCategory || pattern.category;\n    }\n  }\n  \n  // Check for unsubscribe link\n  if (hasUnsubscribe) {\n    isJunk = true;\n    junkConfidence = Math.max(junkConfidence, 0.9);\n    junkReasons.push('Has unsubscribe link');\n  }\n  \n  // Check marketing domains\n  if (isMarketingDomain(from)) {\n    isJunk = true;\n    junkConfidence = Math.max(junkConfidence, 0.85);\n    junkReasons.push('From marketing email service');\n  }\n  \n  // 2. CHECK FOR TASKS (if not junk)\n  let hasTask = false;\n  let taskMatches = [];\n  let taskConfidence = 0;\n  \n  if (!isJunk) {\n    taskMatches = containsKeywords(fullText, TASK_KEYWORDS);\n    hasTask = taskMatches.length > 0;\n    taskConfidence = hasTask ? 0.7 : 0;\n  }\n  \n  // 3. CHECK FOR MEETINGS (if not junk)\n  let hasMeeting = false;\n  let meetingMatches = [];\n  let meetingConfidence = 0;\n  \n  if (!isJunk) {\n    meetingMatches = containsKeywords(fullText, MEETING_KEYWORDS);\n    hasMeeting = meetingMatches.length > 0;\n    meetingConfidence = hasMeeting ? 0.75 : 0;\n  }\n  \n  // 4. DETERMINE PRIMARY CATEGORY\n  let primaryCategory = 'important'; // Default\n  let confidence = 0;\n  \n  if (isJunk) {\n    primaryCategory = 'junk';\n    confidence = junkConfidence;\n  } else if (hasTask && hasMeeting) {\n    primaryCategory = 'both';\n    confidence = 0.8;\n  } else if (hasTask) {\n    primaryCategory = 'task';\n    confidence = taskConfidence;\n  } else if (hasMeeting) {\n    primaryCategory = 'meeting';\n    confidence = meetingConfidence;\n  }\n  \n  // 5. BUILD RESULT\n  const result = {\n    json: {\n      // Email info\n      emailId: emailId,\n      threadId: threadId,\n      from: from,\n      subject: subject,\n      snippet: bodyText.substring(0, 300),\n      receivedDate: date,\n      labelIds: labelIds,\n      \n      // Primary categorization\n      primaryCategory: primaryCategory,\n      confidence: confidence,\n      \n      // Detailed flags\n      isJunk: isJunk,\n      hasTask: hasTask,\n      hasMeeting: hasMeeting,\n      \n      // Category-specific details\n      junkDetails: isJunk ? {\n        category: junkCategory,\n        reasons: junkReasons,\n        confidence: junkConfidence\n      } : null,\n      \n      taskDetails: hasTask ? {\n        title: subject.substring(0, 100),\n        description: bodyText.substring(0, 300),\n        matchedKeywords: taskMatches,\n        confidence: taskConfidence\n      } : null,\n      \n      meetingDetails: hasMeeting ? {\n        title: subject.substring(0, 100),\n        description: bodyText.substring(0, 300),\n        matchedKeywords: meetingMatches,\n        confidence: meetingConfidence\n      } : null,\n      \n      // Metadata\n      processedAt: new Date().toISOString(),\n      gmailLink: `https://mail.google.com/mail/u/0/#inbox/${emailId}`\n    }\n  };\n  \n  results.push(result);\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        -104
+      ],
+      "name": "Code in JavaScript",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.primaryCategory }}",
+                    "rightValue": "junk",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "dca3b5a1-f74e-4b5b-863d-ddf64e413ae5"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "9c12f6ae-be47-465e-a3bd-c8e17885dfcb",
+                    "leftValue": "={{ $json.primaryCategory }}",
+                    "rightValue": "task",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "334e4bce-7558-441b-a470-fc9cf8a42a67",
+                    "leftValue": "={{ $json.primaryCategory }}",
+                    "rightValue": "meeting",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "3ff08c31-d75b-42b4-9b13-e15cdbaa19a7",
+                    "leftValue": "={{ $json.primaryCategory }}",
+                    "rightValue": "both",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.3,
+      "position": [
+        448,
+        -32
+      ],
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "1NDUnvAz1fGr5eOfw76YYVEQB2qW5_V4qLZ85jxgtZt0",
+          "mode": "list",
+          "cachedResultName": "Email Actions Log",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1NDUnvAz1fGr5eOfw76YYVEQB2qW5_V4qLZ85jxgtZt0/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Sheet1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1NDUnvAz1fGr5eOfw76YYVEQB2qW5_V4qLZ85jxgtZt0/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Email ID": "={{ $json.emailId }}",
+            "From": "={{ $json.from }}",
+            "Subject": "={{ $json.subject }}",
+            "Category": "={{ $json.primaryCategory }}",
+            "Confidence": "={{ $json.confidence }}",
+            "Task?": "={{ $json.hasTask }}",
+            "Junk Type": "={{ $json.isJunk }}",
+            "Meeting?": "={{ $json.hasMeeting }}",
+            "Processed At": "={{ $json.processedAt }}",
+            "Link": "={{ $json.gmailLink }}"
+          },
+          "matchingColumns": [
+            "Email ID"
+          ],
+          "schema": [
+            {
+              "id": "Email ID",
+              "displayName": "Email ID",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "From",
+              "displayName": "From",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Subject",
+              "displayName": "Subject",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Category",
+              "displayName": "Category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Confidence",
+              "displayName": "Confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Junk Type",
+              "displayName": "Junk Type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Task?",
+              "displayName": "Task?",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Meeting?",
+              "displayName": "Meeting?",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Processed At",
+              "displayName": "Processed At",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Link",
+              "displayName": "Link",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        448,
+        -224
+      ],
+      "name": "Append or update row in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "yQYnHpUe1bApw4VI",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0A1SDZDE6L",
+          "mode": "list",
+          "cachedResultName": "email-test"
+        },
+        "text": "=test",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        704,
+        -80
+      ],
+      "name": "Send a message",
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "5CgayicyUMqBnUPv",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Append or update row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [],
+        [],
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "staticData": {
+    "node:Gmail Trigger": {
+      "Gmail Trigger": {
+        "lastTimeChecked": 1765058772,
+        "possibleDuplicates": [
+          "19af5b385a126710",
+          "19af5b211be8658d"
+        ]
+      }
+    }
+  },
+  "tags": [],
+  "pinData": {}
+}

@@ -317,16 +317,18 @@ Based on this analysis, provide:
 2. QUICK FIX: ONE specific action to improve reliability (5-30 min to implement)
 
 3. IMPLEMENTATION: Provide concrete, implementable changes. Choose ONE approach:
-   - ADD_RETRY: Add retry logic to a specific node. Specify node name and retry settings.
-   - ADD_ERROR_HANDLING: Add an error workflow or error trigger node.
    - UPDATE_NODE: Update a node's parameters (e.g., timeout, credentials, settings).
    - ADD_NODE: Add a new node to the workflow (e.g., IF node for error handling).
    - FIX_SETTINGS: Update workflow-level settings.
+   - ADD_ERROR_HANDLING: Add an error workflow or error trigger node.
    - REMOVE_NODE: Remove a redundant or problematic node.
    - UPDATE_CONNECTIONS: Fix or update node connections.
 
+   NOTE: Do NOT suggest retry settings (retryOnFail, maxTries) - these cannot be set via API.
+   Instead suggest timeout increases, error handling nodes, or other workflow changes.
+
    Format as JSON:
-   {{"action": "ADD_RETRY|ADD_ERROR_HANDLING|UPDATE_NODE|ADD_NODE|FIX_SETTINGS|REMOVE_NODE|UPDATE_CONNECTIONS", "details": {{"node_name": "...", "changes": {{...}}}}}}
+   {{"action": "UPDATE_NODE|ADD_NODE|FIX_SETTINGS|ADD_ERROR_HANDLING|REMOVE_NODE|UPDATE_CONNECTIONS", "details": {{"node_name": "...", "changes": {{...}}}}}}
 
 4. STATUS: Is this workflow:
    - HEALTHY: Working as intended
@@ -648,27 +650,13 @@ def apply_workflow_fix(workflow, implementation):
         return {'success': False, 'error': f'Failed to copy workflow: {str(e)}'}
 
     if action == 'ADD_RETRY':
-        node_name = details.get('node_name', '')
-        if not node_name:
-            return {'success': False, 'error': 'Node name not specified'}
-        
-        retry_settings = details.get('changes', {})
-        node_found = False
-        
-        for node in nodes:
-            if node.get('name') == node_name:
-                node_found = True
-                # Add retry settings
-                if 'retryOnFail' not in node:
-                    node['retryOnFail'] = True
-                if 'maxTries' not in node:
-                    node['maxTries'] = retry_settings.get('maxTries', 3)
-                if 'waitBetweenTries' not in node:
-                    node['waitBetweenTries'] = retry_settings.get('waitBetweenTries', 1000)
-                break
-        
-        if not node_found:
-            return {'success': False, 'error': f'Node "{node_name}" not found in workflow'}
+        # Note: n8n API doesn't support setting retry configuration via workflow JSON
+        # Retry settings (retryOnFail, maxTries, waitBetweenTries) are execution settings
+        # that must be configured in the n8n UI, not via the API
+        return {
+            'success': False,
+            'error': 'ADD_RETRY is not supported via n8n API. Retry settings must be configured manually in the n8n workflow editor. You can set these in the node settings under "Settings" > "Retry On Fail".'
+        }
     
     elif action == 'UPDATE_NODE':
         node_name = details.get('node_name', '')
