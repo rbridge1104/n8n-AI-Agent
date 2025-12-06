@@ -17,11 +17,6 @@ from rich.text import Text
 
 console = Console()
 
-# Track if we've already shown Ollama connection warnings
-_ollama_warning_shown = False
-# Store user's fallback service choice
-_fallback_service_choice = None
-
 
 def load_env():
     """Load environment variables from .env file"""
@@ -36,16 +31,14 @@ def load_env():
         console.print("[yellow]Copy .env.example to .env and fill in your credentials[/yellow]")
         sys.exit(1)
 
-    # At least one AI service required (Ollama, Groq, or Gemini)
+    # At least one AI service required (Ollama or Groq)
     has_ollama = os.getenv('OLLAMA_URL') and os.getenv('OLLAMA_MODEL')
     has_groq = os.getenv('GROQ_API_KEY')
-    has_gemini = os.getenv('GEMINI_API_KEY')
 
-    if not has_ollama and not has_groq and not has_gemini:
+    if not has_ollama and not has_groq:
         console.print("[red]Error: At least one AI service must be configured:[/red]")
         console.print("[yellow]  - Ollama (OLLAMA_URL + OLLAMA_MODEL), or[/yellow]")
-        console.print("[yellow]  - Groq (GROQ_API_KEY), or[/yellow]")
-        console.print("[yellow]  - Gemini (GEMINI_API_KEY)[/yellow]")
+        console.print("[yellow]  - Groq (GROQ_API_KEY)[/yellow]")
         sys.exit(1)
 
 
@@ -82,11 +75,48 @@ def update_workflow(workflow_id, workflow_data):
         "Content-Type": "application/json"
     }
 
-    # Clean workflow data - remove read-only fields that n8n doesn't accept
-    clean_data = copy.deepcopy(workflow_data)
-    read_only_fields = ['id', 'createdAt', 'updatedAt', 'versionId', 'meta']
-    for field in read_only_fields:
-        clean_data.pop(field, None)
+    # n8n API only accepts specific fields for workflow updates
+    # Only include fields that are allowed by the API
+    allowed_fields = ['name', 'nodes', 'connections', 'active', 'settings', 'staticData', 'tags', 'pinData']
+    clean_data = {}
+    
+    # Name is required - ensure it's included
+    if 'name' not in workflow_data:
+        # Try to get name from original workflow if available
+        console.print("[yellow]Warning: 'name' field missing, attempting to fetch from workflow...[/yellow]")
+        try:
+            original = fetch_workflows(workflow_id)
+            if original and len(original) > 0:
+                workflow_data['name'] = original[0].get('name', 'Untitled Workflow')
+        except:
+            workflow_data['name'] = 'Untitled Workflow'
+    
+    for field in allowed_fields:
+        if field in workflow_data:
+            clean_data[field] = workflow_data[field]
+    
+    # Ensure name is always present (required by API)
+    if 'name' not in clean_data:
+        return {'success': False, 'error': 'Workflow name is required but was not provided'}
+    
+    # Clean nodes - remove read-only fields that cause API errors
+    if 'nodes' in clean_data:
+        for node in clean_data['nodes']:
+            # Remove read-only fields
+            for field in ['id', 'createdAt', 'updatedAt', 'versionId', 'meta', 'webhookId']:
+                node.pop(field, None)
+            # Clean credentials to only include id and name
+            if 'credentials' in node and isinstance(node['credentials'], dict):
+                cleaned_creds = {}
+                for cred_type, cred_data in node['credentials'].items():
+                    if isinstance(cred_data, dict):
+                        cleaned_creds[cred_type] = {
+                            'id': cred_data.get('id'),
+                            'name': cred_data.get('name')
+                        }
+                    else:
+                        cleaned_creds[cred_type] = cred_data
+                node['credentials'] = cleaned_creds
 
     try:
         response = requests.put(url, headers=headers, json=clean_data, timeout=30)
@@ -103,7 +133,8 @@ def update_workflow(workflow_id, workflow_data):
                 elif isinstance(error_detail, dict):
                     error_msg = f"{error_msg} - {json.dumps(error_detail)}"
             except:
-                error_msg = f"{error_msg} - {e.response.text[:200]}"
+                if hasattr(e.response, 'text'):
+                    error_msg = f"{error_msg} - {e.response.text[:200]}"
         return {'success': False, 'error': error_msg}
 
 
@@ -120,20 +151,6 @@ def fetch_executions(workflow_id, limit=20):
         return response.json().get('data', [])
     except (json.JSONDecodeError, requests.RequestException):
         return []
-
-
-def fetch_execution_details(execution_id):
-    """Fetch full execution details including error messages"""
-    base_url = os.getenv('N8N_URL').rstrip('/')
-    url = f"{base_url}/api/v1/executions/{execution_id}"
-    headers = {"X-N8N-API-KEY": os.getenv('N8N_API_KEY')}
-
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        return response.json()
-    except (json.JSONDecodeError, requests.RequestException):
-        return None
 
 
 def analyze_workflow_structure(workflow):
@@ -164,51 +181,6 @@ def analyze_workflow_structure(workflow):
     }
 
 
-def extract_error_messages(executions):
-    """Extract unique error messages from failed executions"""
-    error_messages = []
-    failed_execution_ids = []
-    
-    for execution in executions:
-        # Check if execution failed
-        finished = execution.get('finished', False)
-        exec_data = execution.get('data', {})
-        result_data = exec_data.get('resultData', {})
-        has_error = bool(result_data.get('error'))
-        
-        # Execution failed if it finished but has error, or if it didn't finish
-        if finished and has_error:
-            failed_execution_ids.append(execution.get('id'))
-        elif not finished:
-            # Execution didn't complete - might be in progress or failed
-            failed_execution_ids.append(execution.get('id'))
-    
-    # Fetch full details for failed executions to get error messages
-    unique_errors = set()
-    for exec_id in failed_execution_ids[:10]:  # Limit to 10 to avoid too many API calls
-        details = fetch_execution_details(exec_id)
-        if details:
-            # Extract error messages from execution data
-            data = details.get('data', {})
-            result_data = data.get('resultData', {})
-            
-            # Check for errors in resultData
-            if result_data.get('error'):
-                error = result_data['error']
-                error_msg = error.get('message', str(error))
-                unique_errors.add(error_msg)
-            
-            # Check for errors in node execution data
-            for node_name, node_data in result_data.get('runData', {}).items():
-                for output in node_data.get('output', []):
-                    for item in output:
-                        if isinstance(item, dict) and 'error' in item:
-                            error_msg = item['error'].get('message', str(item['error']))
-                            unique_errors.add(error_msg)
-    
-    return list(unique_errors)
-
-
 def calculate_health(workflow, executions):
     """Calculate workflow health metrics"""
     total = len(executions)
@@ -220,8 +192,7 @@ def calculate_health(workflow, executions):
             'total_count': 0,
             'last_run': None,
             'last_success': None,
-            'never_succeeded': True,
-            'error_messages': []
+            'never_succeeded': True
         }
 
     successful = 0
@@ -242,8 +213,6 @@ def calculate_health(workflow, executions):
             has_error = True
         
         # Determine if execution was successful
-        # Success: finished is True and no error in resultData
-        # Note: stoppedAt is the timestamp when execution stopped (success or failure)
         is_success = finished and not has_error
         
         if is_success:
@@ -259,9 +228,6 @@ def calculate_health(workflow, executions):
         elif started_at and (not last_run or started_at > last_run):
             last_run = started_at
 
-    # Extract error messages from failed executions
-    error_messages = extract_error_messages(executions)
-
     return {
         'success_rate': (successful / total * 100) if total > 0 else 0,
         'success_count': successful,
@@ -269,8 +235,7 @@ def calculate_health(workflow, executions):
         'total_count': total,
         'last_run': last_run,
         'last_success': last_success,
-        'never_succeeded': successful == 0 and total > 0,
-        'error_messages': error_messages
+        'never_succeeded': successful == 0 and total > 0
     }
 
 
@@ -297,135 +262,9 @@ def time_ago(timestamp_str):
         return "Unknown"
 
 
-def prompt_fallback_service():
-    """Prompt user to choose fallback AI service when Ollama fails"""
-    global _fallback_service_choice
-    
-    # Return cached choice if available
-    if _fallback_service_choice:
-        return _fallback_service_choice
-    
-    groq_api_key = os.getenv('GROQ_API_KEY')
-    gemini_api_key = os.getenv('GEMINI_API_KEY')
-    
-    available_services = []
-    if groq_api_key:
-        available_services.append(('groq', 'Groq'))
-    if gemini_api_key:
-        available_services.append(('gemini', 'Gemini'))
-    
-    if not available_services:
-        return None
-    
-    if len(available_services) == 1:
-        # Only one option, use it automatically
-        _fallback_service_choice = available_services[0][0]
-        return _fallback_service_choice
-    
-    # Multiple options, prompt user
-    console.print()
-    console.print("[yellow]Ollama is not available. Choose a fallback AI service:[/yellow]")
-    for i, (key, name) in enumerate(available_services, 1):
-        console.print(f"  {i}. {name}")
-    
-    while True:
-        try:
-            choice = input("\n[bold green]Enter choice (1-{}):[/bold green] ".format(len(available_services))).strip()
-            choice_num = int(choice)
-            if 1 <= choice_num <= len(available_services):
-                _fallback_service_choice = available_services[choice_num - 1][0]
-                console.print(f"[green]Using {available_services[choice_num - 1][1]} as fallback[/green]")
-                console.print()
-                return _fallback_service_choice
-            else:
-                console.print("[red]Invalid choice. Please enter a number between 1 and {}[/red]".format(len(available_services)))
-        except ValueError:
-            console.print("[red]Invalid input. Please enter a number.[/red]")
-        except (KeyboardInterrupt, EOFError):
-            console.print("\n[yellow]Cancelled. Using first available service.[/yellow]")
-            _fallback_service_choice = available_services[0][0]
-            return _fallback_service_choice
-
-
-def call_gemini_api(prompt):
-    """Call Google Gemini API"""
-    gemini_api_key = os.getenv('GEMINI_API_KEY')
-    # Default to gemini-2.5-flash (latest fast model) or use gemini-2.5-pro for better quality
-    gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
-    
-    if not gemini_api_key:
-        return None
-    
-    try:
-        # Try v1beta first
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_api_key}"
-        headers = {
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "contents": [{
-                "parts": [{
-                    "text": prompt
-                }]
-            }]
-        }
-        response = requests.post(url, json=payload, headers=headers, timeout=60)
-        response.raise_for_status()
-        result = response.json()
-        
-        # Extract text from Gemini response
-        if 'candidates' in result and len(result['candidates']) > 0:
-            content = result['candidates'][0].get('content', {})
-            parts = content.get('parts', [])
-            if parts and 'text' in parts[0]:
-                return parts[0]['text']
-        
-        return None
-    except requests.exceptions.HTTPError as e:
-        # If v1beta fails with 404, try v1 API as fallback
-        if e.response and e.response.status_code == 404:
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1/models/{gemini_model}:generateContent?key={gemini_api_key}"
-                response = requests.post(url, json=payload, headers=headers, timeout=60)
-                response.raise_for_status()
-                result = response.json()
-                
-                # Extract text from Gemini response
-                if 'candidates' in result and len(result['candidates']) > 0:
-                    content = result['candidates'][0].get('content', {})
-                    parts = content.get('parts', [])
-                    if parts and 'text' in parts[0]:
-                        return parts[0]['text']
-            except requests.RequestException:
-                pass  # Fall through to error message
-        
-        # Only show error if both attempts failed
-        console.print(f"[red]Gemini API HTTP error: {e}[/red]", style="dim")
-        if hasattr(e.response, 'text'):
-            error_text = e.response.text[:200]
-            console.print(f"[red]Response: {error_text}[/red]", style="dim")
-            # Suggest valid model names if model not found
-            if 'not found' in error_text.lower() or 'not supported' in error_text.lower():
-                console.print("[yellow]💡 Tip: Try setting GEMINI_MODEL to 'gemini-1.5-flash' or 'gemini-1.5-pro'[/yellow]", style="dim")
-        return None
-    except requests.RequestException as e:
-        console.print(f"[red]Gemini API request failed: {e}[/red]", style="dim")
-        return None
-
-
 def ask_ollama(workflow, health, structure):
-    """Ask Ollama (or fallback to Gemini/Groq) for comprehensive workflow analysis"""
-    global _ollama_warning_shown
+    """Ask Ollama (or Groq/Gemini fallback) for comprehensive workflow analysis with implementation plan"""
     active_status = "active" if workflow.get('active') else "inactive"
-    
-    # Build failure analysis section
-    failure_analysis = ""
-    if health['failed_count'] > 0 and health['error_messages']:
-        failure_analysis = "\n\nFAILURE ANALYSIS:\n\nRecent error messages:\n"
-        for i, error in enumerate(health['error_messages'][:10], 1):
-            failure_analysis += f"{i}. {error}\n"
-    elif health['failed_count'] > 0:
-        failure_analysis = "\n\nFAILURE ANALYSIS:\n\nExecutions are failing but no detailed error messages were captured."
     
     # Build workflow structure section
     node_types_list = ", ".join([f"{k} ({v})" for k, v in structure['node_types'].items()])
@@ -436,31 +275,29 @@ Workflow: {workflow['name']}
 Status: {active_status}
 
 EXECUTION HISTORY:
-
 - Total executions checked: {health['total_count']}
 - Success rate: {health['success_rate']:.1f}%
 - Successful runs: {health['success_count']}
 - Failed runs: {health['failed_count']}
 - Last successful run: {time_ago(health['last_success'])}
 - Last run: {time_ago(health['last_run'])}
-{failure_analysis}
-WORKFLOW STRUCTURE:
+- Never succeeded: {'Yes' if health.get('never_succeeded') else 'No'}
 
+WORKFLOW STRUCTURE:
 - Total nodes: {structure['node_count']}
 - Node types: {node_types_list}
-- Has error handling: {'Yes' if structure['has_error_handling'] else 'No'} - check for error workflow or IF nodes after critical operations
+- Has error handling: {'Yes' if structure['has_error_handling'] else 'No'}
 - Has retry logic: {'Yes' if structure['has_retry_logic'] else 'No'}
 
 WORKFLOW JSON:
-
 {json.dumps(workflow, indent=2)}
 
-Based on this complete picture, provide:
+Based on this analysis, provide:
 
 1. ROOT CAUSE: What's actually wrong with this workflow? Be specific.
    - If it's never run successfully, is it incomplete or misconfigured?
    - If it's failing consistently, what's the likely issue?
-   - If success rate is low, what pattern do you see in the errors?
+   - If success rate is low, what pattern do you see?
 
 2. QUICK FIX: ONE specific action to improve reliability (5-30 min to implement)
 
@@ -470,9 +307,11 @@ Based on this complete picture, provide:
    - UPDATE_NODE: Update a node's parameters (e.g., timeout, credentials, settings).
    - ADD_NODE: Add a new node to the workflow (e.g., IF node for error handling).
    - FIX_SETTINGS: Update workflow-level settings.
+   - REMOVE_NODE: Remove a redundant or problematic node.
+   - UPDATE_CONNECTIONS: Fix or update node connections.
 
    Format as JSON:
-   {{"action": "ADD_RETRY|ADD_ERROR_HANDLING|UPDATE_NODE|ADD_NODE|FIX_SETTINGS", "details": {{"node_name": "...", "changes": {{...}}}}}}
+   {{"action": "ADD_RETRY|ADD_ERROR_HANDLING|UPDATE_NODE|ADD_NODE|FIX_SETTINGS|REMOVE_NODE|UPDATE_CONNECTIONS", "details": {{"node_name": "...", "changes": {{...}}}}}}
 
 4. STATUS: Is this workflow:
    - HEALTHY: Working as intended
@@ -504,14 +343,6 @@ STATUS:
     # Default to localhost if OLLAMA_URL not set
     if not ollama_url:
         ollama_url = 'http://localhost:11434'
-        if not _ollama_warning_shown:
-            console.print("[dim]OLLAMA_URL not set, using default: http://localhost:11434[/dim]")
-    
-    if not ollama_model:
-        if not _ollama_warning_shown:
-            console.print("[yellow]⚠️  OLLAMA_MODEL not set in environment variables[/yellow]")
-            console.print("[yellow]   Add OLLAMA_MODEL to your .env file (e.g., OLLAMA_MODEL=llama3.2)[/yellow]")
-            console.print()
     
     if ollama_url and ollama_model:
         try:
@@ -530,83 +361,67 @@ STATUS:
                 'service': 'Ollama',
                 'model': ollama_model
             }
-        except requests.exceptions.ConnectionError as e:
-            if not _ollama_warning_shown:
-                console.print(f"[yellow]⚠️  Ollama connection failed: {e}[/yellow]")
-                console.print(f"[yellow]   Trying to connect to: {ollama_url}[/yellow]")
-                console.print("[yellow]   Make sure Ollama is running: ollama serve[/yellow]")
-                _ollama_warning_shown = True
-        except requests.exceptions.Timeout:
-            if not _ollama_warning_shown:
-                console.print("[yellow]⚠️  Ollama request timed out.[/yellow]")
-                _ollama_warning_shown = True
-        except requests.exceptions.HTTPError as e:
-            if not _ollama_warning_shown:
-                console.print(f"[yellow]⚠️  Ollama HTTP error: {e}[/yellow]")
-                console.print(f"[yellow]   Check if model '{ollama_model}' exists: ollama list[/yellow]")
-                _ollama_warning_shown = True
-        except requests.RequestException as e:
-            if not _ollama_warning_shown:
-                console.print(f"[yellow]⚠️  Ollama request failed: {e}[/yellow]")
-                _ollama_warning_shown = True
+        except requests.RequestException:
+            pass  # Fall through to Groq/Gemini
 
-    # Ollama failed or not configured - prompt for fallback service
-    fallback_service = prompt_fallback_service()
-    
-    if not fallback_service:
-        # No fallback services available
-        return {
-            'response': "Unable to connect to AI service. Ollama failed and no fallback services (Groq/Gemini) are configured.",
-            'service': 'None',
-            'model': 'N/A'
-        }
-    
-    if fallback_service == 'groq':
-        # Use Groq
-        groq_api_key = os.getenv('GROQ_API_KEY')
-        groq_model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
-        if groq_api_key:
-            try:
-                url = "https://api.groq.com/openai/v1/chat/completions"
-                headers = {
-                    "Authorization": f"Bearer {groq_api_key}",
-                    "Content-Type": "application/json"
-                }
-                payload = {
-                    "model": groq_model,
-                    "messages": [
-                        {"role": "user", "content": prompt}
-                    ],
-                    "temperature": 0.7,
-                    "max_tokens": 1000
-                }
-                response = requests.post(url, json=payload, headers=headers, timeout=60)
-                response.raise_for_status()
-                response_text = response.json()['choices'][0]['message']['content']
-                return {
-                    'response': response_text,
-                    'service': 'Groq',
-                    'model': groq_model
-                }
-            except requests.RequestException as e:
-                console.print(f"[red]Groq API error: {e}[/red]")
-    
-    elif fallback_service == 'gemini':
-        # Use Gemini
-        gemini_model = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
-        response_text = call_gemini_api(prompt)
-        if response_text:
+    # Fallback to Groq if Ollama fails
+    groq_api_key = os.getenv('GROQ_API_KEY')
+    groq_model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
+    if groq_api_key:
+        try:
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {groq_api_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": groq_model,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.7,
+                "max_tokens": 1500
+            }
+            response = requests.post(url, json=payload, headers=headers, timeout=60)
+            response.raise_for_status()
+            response_text = response.json()['choices'][0]['message']['content']
             return {
                 'response': response_text,
-                'service': 'Gemini',
-                'model': gemini_model
+                'service': 'Groq',
+                'model': groq_model
             }
-        else:
-            console.print("[red]Gemini API call failed[/red]")
+        except requests.RequestException:
+            pass
 
-    # All services failed
+    # Fallback to Gemini
+    gemini_api_key = os.getenv('GEMINI_API_KEY')
+    gemini_model = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
+    if gemini_api_key:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_api_key}"
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "contents": [{
+                    "parts": [{"text": prompt}]
+                }]
+            }
+            response = requests.post(url, json=payload, headers=headers, timeout=60)
+            response.raise_for_status()
+            result = response.json()
+            if 'candidates' in result and len(result['candidates']) > 0:
+                content = result['candidates'][0].get('content', {})
+                parts = content.get('parts', [])
+                if parts and 'text' in parts[0]:
+                    return {
+                        'response': parts[0]['text'],
+                        'service': 'Gemini',
+                        'model': gemini_model
+                    }
+        except requests.RequestException:
+            pass
+
     return {
-        'response': "Unable to connect to AI service (tried Ollama and fallback)",
+        'response': "Unable to connect to AI service (tried Ollama, Groq, and Gemini)",
         'service': 'None',
         'model': 'N/A'
     }
@@ -620,7 +435,7 @@ def parse_ai_response(response_text):
         'implementation': None,
         'status': ''
     }
-
+    
     # Extract ROOT CAUSE
     if 'ROOT CAUSE:' in response_text:
         parts = response_text.split('ROOT CAUSE:')
@@ -630,7 +445,7 @@ def parse_ai_response(response_text):
                 result['root_cause'] = remaining.split('QUICK FIX:')[0].strip()
             else:
                 result['root_cause'] = remaining.strip()
-
+    
     # Extract QUICK FIX
     if 'QUICK FIX:' in response_text:
         parts = response_text.split('QUICK FIX:')
@@ -642,7 +457,7 @@ def parse_ai_response(response_text):
                 result['quick_fix'] = remaining.split('STATUS:')[0].strip()
             else:
                 result['quick_fix'] = remaining.strip()
-
+    
     # Extract IMPLEMENTATION (JSON)
     if 'IMPLEMENTATION:' in response_text or '```json' in response_text:
         try:
@@ -653,133 +468,299 @@ def parse_ai_response(response_text):
                 if json_end > json_start:
                     json_str = response_text[json_start:json_end].strip()
                     result['implementation'] = json.loads(json_str)
+            elif 'IMPLEMENTATION:' in response_text:
+                # Try to extract JSON after IMPLEMENTATION:
+                impl_start = response_text.find('IMPLEMENTATION:') + len('IMPLEMENTATION:')
+                impl_text = response_text[impl_start:].strip()
+                # Look for JSON object
+                json_start = impl_text.find('{')
+                if json_start >= 0:
+                    json_end = impl_text.rfind('}') + 1
+                    if json_end > json_start:
+                        json_str = impl_text[json_start:json_end]
+                        result['implementation'] = json.loads(json_str)
         except (json.JSONDecodeError, ValueError):
-            # If JSON parsing fails, implementation will remain None
             pass
-
+    
     # Extract STATUS
     if 'STATUS:' in response_text:
         parts = response_text.split('STATUS:')
         if len(parts) > 1:
             result['status'] = parts[1].strip().split('\n')[0].strip()
-
-    # If parsing failed, return raw response
+    
+    # If parsing failed, return raw response as root cause
     if not any([result['root_cause'], result['quick_fix'], result['status']]):
         result['root_cause'] = response_text
-
+    
     return result
 
 
-def apply_fix_to_workflow(workflow, implementation):
-    """Apply AI-suggested fix to workflow JSON"""
+def generate_workflow_modifications(workflow, implementation, ai_service='Ollama'):
+    """Use AI to generate actual workflow JSON modifications based on implementation plan"""
+    if not implementation or 'action' not in implementation:
+        return {'success': False, 'error': 'No implementation provided'}
+    
+    action = implementation.get('action', '')
+    details = implementation.get('details', {})
+    
+    prompt = f"""You are an n8n workflow expert. Generate the exact JSON modifications needed to implement this change:
+
+Action: {action}
+Details: {json.dumps(details, indent=2)}
+
+Current Workflow JSON:
+{json.dumps(workflow, indent=2)}
+
+Generate the MODIFIED workflow JSON with ONLY the changes needed. Return ONLY valid JSON that can be used to update the workflow via n8n API.
+
+Important:
+- Only include fields allowed by n8n API: name, nodes, connections, active, settings, staticData, tags, pinData
+- Do NOT include read-only fields: id, createdAt, updatedAt, versionId, meta
+- Preserve all existing nodes and connections unless explicitly changing them
+- Make minimal changes - only what's needed for the implementation
+
+Return ONLY the JSON object, no explanation."""
+
+    # Use the same AI service that was used for analysis
+    ollama_url = os.getenv('OLLAMA_URL', 'http://localhost:11434')
+    ollama_model = os.getenv('OLLAMA_MODEL')
+    
+    if ai_service == 'Ollama' and ollama_model:
+        try:
+            base_url = ollama_url.rstrip('/')
+            url = f"{base_url}/api/generate"
+            payload = {
+                "model": ollama_model,
+                "prompt": prompt,
+                "stream": False
+            }
+            response = requests.post(url, json=payload, timeout=90)
+            response.raise_for_status()
+            response_text = response.json().get('response', '')
+        except requests.RequestException:
+            response_text = None
+    else:
+        response_text = None
+    
+    # Fallback to Groq
+    if not response_text:
+        groq_api_key = os.getenv('GROQ_API_KEY')
+        if groq_api_key:
+            try:
+                url = "https://api.groq.com/openai/v1/chat/completions"
+                headers = {
+                    "Authorization": f"Bearer {groq_api_key}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "model": os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile'),
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,  # Lower temperature for more precise JSON
+                    "max_tokens": 4000
+                }
+                response = requests.post(url, json=payload, headers=headers, timeout=90)
+                response.raise_for_status()
+                response_text = response.json()['choices'][0]['message']['content']
+            except requests.RequestException:
+                return {'success': False, 'error': 'Failed to connect to AI service'}
+    
+    # Try to extract JSON from response
+    try:
+        # Try to find JSON in the response
+        json_start = response_text.find('{')
+        if json_start >= 0:
+            json_end = response_text.rfind('}') + 1
+            if json_end > json_start:
+                json_str = response_text[json_start:json_end]
+                modified_workflow = json.loads(json_str)
+                
+                # Clean the workflow - ensure it has required fields and only allowed fields
+                allowed_fields = ['name', 'nodes', 'connections', 'active', 'settings', 'staticData', 'tags', 'pinData']
+                clean_workflow = {}
+                
+                # Always include name (required by API) - use original if AI didn't include it
+                if 'name' in modified_workflow:
+                    clean_workflow['name'] = modified_workflow['name']
+                elif workflow.get('name'):
+                    clean_workflow['name'] = workflow['name']
+                else:
+                    return {'success': False, 'error': 'Workflow name is required but missing'}
+                
+                # Include other allowed fields if they exist in AI response
+                for field in allowed_fields:
+                    if field != 'name' and field in modified_workflow:
+                        clean_workflow[field] = modified_workflow[field]
+                
+                # Clean nodes - remove read-only fields
+                if 'nodes' in clean_workflow:
+                    for node in clean_workflow['nodes']:
+                        for field in ['id', 'createdAt', 'updatedAt', 'versionId', 'meta', 'webhookId']:
+                            node.pop(field, None)
+                        # Clean credentials
+                        if 'credentials' in node and isinstance(node['credentials'], dict):
+                            cleaned_creds = {}
+                            for cred_type, cred_data in node['credentials'].items():
+                                if isinstance(cred_data, dict):
+                                    cleaned_creds[cred_type] = {
+                                        'id': cred_data.get('id'),
+                                        'name': cred_data.get('name')
+                                    }
+                                else:
+                                    cleaned_creds[cred_type] = cred_data
+                            node['credentials'] = cleaned_creds
+                
+                return {'success': True, 'workflow': clean_workflow}
+    except (json.JSONDecodeError, ValueError) as e:
+        return {'success': False, 'error': f'Failed to parse AI response as JSON: {str(e)}'}
+    
+    return {'success': False, 'error': 'No valid JSON found in AI response'}
+
+
+def apply_workflow_fix(workflow, implementation):
+    """Apply AI-suggested fix directly to workflow JSON (simpler approach)"""
     if not implementation or 'action' not in implementation:
         return {'success': False, 'error': 'No implementation provided'}
 
     action = implementation.get('action', '')
     details = implementation.get('details', {})
-
+    
     # Make a deep copy to avoid modifying the original
     try:
         updated_workflow = copy.deepcopy(workflow)
         nodes = updated_workflow.get('nodes', [])
+        connections = updated_workflow.get('connections', {})
     except Exception as e:
         return {'success': False, 'error': f'Failed to copy workflow: {str(e)}'}
 
     if action == 'ADD_RETRY':
-        # Add retry logic to a specific node
         node_name = details.get('node_name', '')
         if not node_name:
             return {'success': False, 'error': 'Node name not specified'}
-
+        
         retry_settings = details.get('changes', {})
         node_found = False
-
+        
         for node in nodes:
             if node.get('name') == node_name:
                 node_found = True
-                # Add retry settings to node
+                # Add retry settings
                 if 'retryOnFail' not in node:
                     node['retryOnFail'] = True
                 if 'maxTries' not in node:
                     node['maxTries'] = retry_settings.get('maxTries', 3)
                 if 'waitBetweenTries' not in node:
                     node['waitBetweenTries'] = retry_settings.get('waitBetweenTries', 1000)
-                return {'success': True, 'workflow': updated_workflow}
-
+                break
+        
         if not node_found:
             return {'success': False, 'error': f'Node "{node_name}" not found in workflow'}
-
+    
     elif action == 'UPDATE_NODE':
-        # Update node parameters
         node_name = details.get('node_name', '')
         if not node_name:
             return {'success': False, 'error': 'Node name not specified'}
-
+        
         changes = details.get('changes', {})
         node_found = False
-
+        
         for node in nodes:
             if node.get('name') == node_name:
                 node_found = True
-                # Update parameters
                 if 'parameters' not in node:
                     node['parameters'] = {}
                 for key, value in changes.items():
                     node['parameters'][key] = value
-                return {'success': True, 'workflow': updated_workflow}
-
+                break
+        
         if not node_found:
             return {'success': False, 'error': f'Node "{node_name}" not found in workflow'}
-
+    
+    elif action == 'REMOVE_NODE':
+        node_name = details.get('node_name', '')
+        if not node_name:
+            return {'success': False, 'error': 'Node name not specified'}
+        
+        # Remove node
+        nodes[:] = [n for n in nodes if n.get('name') != node_name]
+        
+        # Remove connections involving this node
+        connections_to_remove = []
+        for source_node, outputs in connections.items():
+            if source_node == node_name:
+                connections_to_remove.append(source_node)
+            else:
+                for output_type, output_connections in outputs.items():
+                    for connection_list in output_connections:
+                        connection_list[:] = [c for c in connection_list if c.get('node') != node_name]
+        
+        for node_to_remove in connections_to_remove:
+            del connections[node_to_remove]
+    
+    elif action == 'UPDATE_CONNECTIONS':
+        # Update connections based on details
+        new_connections = details.get('connections', {})
+        if new_connections:
+            updated_workflow['connections'] = new_connections
+    
     elif action == 'FIX_SETTINGS':
-        # Update workflow settings
         settings = details.get('changes', {})
         if not settings:
             return {'success': False, 'error': 'No settings changes specified'}
-
+        
         if 'settings' not in updated_workflow:
             updated_workflow['settings'] = {}
-
+        
         for key, value in settings.items():
             updated_workflow['settings'][key] = value
-        return {'success': True, 'workflow': updated_workflow}
+    
+    # Clean the workflow data for API - only include allowed fields
+    allowed_fields = ['name', 'nodes', 'connections', 'active', 'settings', 'staticData', 'tags', 'pinData']
+    clean_workflow = {}
+    
+    # Always include name (required by API)
+    if 'name' in updated_workflow:
+        clean_workflow['name'] = updated_workflow['name']
+    elif workflow.get('name'):
+        clean_workflow['name'] = workflow['name']
+    else:
+        return {'success': False, 'error': 'Workflow name is required but missing'}
+    
+    # Include other allowed fields if they exist
+    for field in allowed_fields:
+        if field != 'name' and field in updated_workflow:
+            clean_workflow[field] = updated_workflow[field]
+    
+    # Clean nodes - remove read-only fields
+    if 'nodes' in clean_workflow:
+        for node in clean_workflow['nodes']:
+            # Remove read-only fields that cause API errors
+            for field in ['id', 'createdAt', 'updatedAt', 'versionId', 'meta', 'webhookId']:
+                node.pop(field, None)
+            # Also clean credentials if present (they're stored separately)
+            if 'credentials' in node:
+                # Keep credentials but ensure they're in the right format
+                creds = node['credentials']
+                if isinstance(creds, dict):
+                    # Keep only id and name for credentials
+                    cleaned_creds = {}
+                    for cred_type, cred_data in creds.items():
+                        if isinstance(cred_data, dict):
+                            cleaned_creds[cred_type] = {
+                                'id': cred_data.get('id'),
+                                'name': cred_data.get('name')
+                            }
+                        else:
+                            cleaned_creds[cred_type] = cred_data
+                    node['credentials'] = cleaned_creds
+    
+    return {'success': True, 'workflow': clean_workflow}
 
-    elif action == 'ADD_ERROR_HANDLING':
-        # Add error trigger node (simplified - would need proper positioning)
-        # Find a good position (to the right of existing nodes)
-        max_x = 0
-        for node in nodes:
-            pos = node.get('position', [0, 0])
-            if len(pos) >= 1 and pos[0] > max_x:
-                max_x = pos[0]
 
-        error_node = {
-            "parameters": {},
-            "name": "Error Trigger",
-            "type": "n8n-nodes-base.errorTrigger",
-            "typeVersion": 1,
-            "position": [max_x + 250, 300]
-        }
-        nodes.append(error_node)
-        return {'success': True, 'workflow': updated_workflow}
-
-    elif action == 'ADD_NODE':
-        # Add a new node based on details
-        new_node = details.get('node', {})
-        if not new_node:
-            return {'success': False, 'error': 'No node definition provided'}
-
-        nodes.append(new_node)
-        return {'success': True, 'workflow': updated_workflow}
-
-    return {'success': False, 'error': f'Unknown action: {action}'}
-
-
-def prompt_for_fix_approval(workflow, implementation, quick_fix):
+def prompt_for_approval(workflow, quick_fix, implementation):
     """Prompt user to approve fix implementation"""
     if not implementation:
         return False
-
+    
     console.print()
     console.print(Panel(
         f"[bold yellow]Fix Available for: {workflow['name']}[/bold yellow]",
@@ -788,11 +769,11 @@ def prompt_for_fix_approval(workflow, implementation, quick_fix):
     console.print()
     console.print(f"[bold]Suggested Fix:[/bold] {quick_fix}")
     console.print()
-
+    
     # Display what will change
     action = implementation.get('action', '')
     details = implementation.get('details', {})
-
+    
     console.print("[bold cyan]Changes to be applied:[/bold cyan]")
     if action == 'ADD_RETRY':
         console.print(f"  • Add retry logic to node: [yellow]{details.get('node_name', 'Unknown')}[/yellow]")
@@ -800,42 +781,40 @@ def prompt_for_fix_approval(workflow, implementation, quick_fix):
         if changes:
             console.print(f"    - Max retries: {changes.get('maxTries', 3)}")
             console.print(f"    - Wait between retries: {changes.get('waitBetweenTries', 1000)}ms")
-
     elif action == 'UPDATE_NODE':
         console.print(f"  • Update node: [yellow]{details.get('node_name', 'Unknown')}[/yellow]")
         changes = details.get('changes', {})
         if changes:
             for key, value in changes.items():
                 console.print(f"    - {key}: {value}")
-
+    elif action == 'REMOVE_NODE':
+        console.print(f"  • Remove node: [yellow]{details.get('node_name', 'Unknown')}[/yellow]")
+    elif action == 'UPDATE_CONNECTIONS':
+        console.print("  • Update workflow connections")
     elif action == 'FIX_SETTINGS':
         console.print("  • Update workflow settings")
         changes = details.get('changes', {})
         if changes:
             for key, value in changes.items():
                 console.print(f"    - {key}: {value}")
-
-    elif action == 'ADD_ERROR_HANDLING':
-        console.print("  • Add Error Trigger node for better error handling")
-
-    elif action == 'ADD_NODE':
-        console.print(f"  • Add new node to workflow")
-
     else:
         console.print(f"  • Action: {action}")
-
+    
     console.print()
-
+    
     # Prompt for approval
-    response = input("[bold green]Apply this fix? (yes/no):[/bold green] ").strip().lower()
-    return response in ['yes', 'y']
+    try:
+        response = input("[bold green]Apply this fix? (yes/no):[/bold green] ").strip().lower()
+        return response in ['yes', 'y']
+    except (KeyboardInterrupt, EOFError):
+        return False
 
 
 def get_status_icon(workflow, health, ai_status=""):
     """Get status icon based on workflow health and AI analysis"""
     if not workflow.get('active'):
         return "🔴"
-
+    
     # Use AI status if available
     if ai_status:
         ai_status_upper = ai_status.upper()
@@ -845,7 +824,7 @@ def get_status_icon(workflow, health, ai_status=""):
             return "🔴"
         elif 'NEEDS ATTENTION' in ai_status_upper:
             return "🟡"
-
+    
     # Fallback to success rate
     if health['success_rate'] >= 90:
         return "🟢"
@@ -863,7 +842,6 @@ def display_workflow_health(workflow, health, ai_analysis):
         ai_service = ai_analysis.get('service', 'Unknown')
         ai_model = ai_analysis.get('model', 'Unknown')
     else:
-        # Backward compatibility with old string format
         ai_response_text = ai_analysis
         ai_service = 'Unknown'
         ai_model = 'Unknown'
@@ -889,7 +867,7 @@ def display_workflow_health(workflow, health, ai_analysis):
         output.append(f"   Success Rate: ", style="dim")
         output.append(f"{health['success_rate']:.0f}% ({health['success_count']}/{health['total_count']} runs)", style=rate_color)
         
-        if health['never_succeeded']:
+        if health.get('never_succeeded'):
             output.append(" ⚠️", style="yellow")
             output.append("\n   ", style="dim")
             output.append("Never succeeded: This workflow has never completed successfully", style="yellow")
@@ -907,9 +885,8 @@ def display_workflow_health(workflow, health, ai_analysis):
         output.append("\n   ", style="dim")
         output.append("🔍 ROOT CAUSE:", style="bold yellow")
         output.append("\n   ", style="dim")
-        # Split into lines and indent
         root_cause_lines = parsed['root_cause'].split('\n')
-        for line in root_cause_lines[:5]:  # Limit to 5 lines
+        for line in root_cause_lines[:5]:
             if line.strip():
                 output.append(line.strip(), style="white")
                 output.append("\n   ", style="dim")
@@ -920,7 +897,7 @@ def display_workflow_health(workflow, health, ai_analysis):
         output.append("💡 QUICK FIX:", style="bold yellow")
         output.append("\n   ", style="dim")
         quick_fix_lines = parsed['quick_fix'].split('\n')
-        for line in quick_fix_lines[:3]:  # Limit to 3 lines
+        for line in quick_fix_lines[:3]:
             if line.strip():
                 output.append(line.strip(), style="white")
                 output.append("\n   ", style="dim")
@@ -939,16 +916,6 @@ def display_workflow_health(workflow, health, ai_analysis):
         else:
             output.append(status_text, style="white bold")
 
-    # Common errors
-    if health.get('error_messages'):
-        output.append("\n\n   ", style="dim")
-        output.append("Common errors:", style="dim italic")
-        for i, error in enumerate(health['error_messages'][:5], 1):
-            output.append(f"\n   ", style="dim")
-            # Truncate long errors
-            error_display = error[:100] + "..." if len(error) > 100 else error
-            output.append(f"- {error_display}", style="red")
-
     # AI Service/Model info
     output.append("\n\n   ", style="dim")
     output.append("🤖 AI Analysis: ", style="dim italic")
@@ -958,6 +925,8 @@ def display_workflow_health(workflow, health, ai_analysis):
 
     console.print(output)
     console.print()
+    
+    return parsed
 
 
 def main():
@@ -1016,34 +985,42 @@ def main():
         structure = analyze_workflow_structure(workflow)
         ai_analysis = ask_ollama(workflow, health, structure)
 
-        display_workflow_health(workflow, health, ai_analysis)
-
-        # Extract response text from dict if needed
-        ai_response_text = ai_analysis.get('response', '') if isinstance(ai_analysis, dict) else ai_analysis
-        parsed = parse_ai_response(ai_response_text)
-        ai_status = parsed.get('status', '').upper()
+        parsed = display_workflow_health(workflow, health, ai_analysis)
 
         # Check if fix is available and workflow needs attention
         implementation = parsed.get('implementation')
-        if implementation and ai_status != 'HEALTHY':
+        ai_status_text = parsed.get('status', '').upper()
+        
+        if implementation and ai_status_text not in ['HEALTHY', '']:
             # Prompt for fix approval
-            if prompt_for_fix_approval(workflow, implementation, parsed.get('quick_fix', '')):
+            if prompt_for_approval(workflow, parsed.get('quick_fix', ''), implementation):
                 console.print("[cyan]Applying fix...[/cyan]")
-
+                
                 # Apply fix to workflow
-                fix_result = apply_fix_to_workflow(workflow, implementation)
-
+                fix_result = apply_workflow_fix(workflow, implementation)
+                
                 if fix_result.get('success'):
                     updated_workflow = fix_result.get('workflow')
-
+                    
                     # Update workflow via API
                     api_result = update_workflow(workflow['id'], updated_workflow)
-
+                    
                     if api_result.get('success'):
                         console.print("[green]✓ Fix applied successfully![/green]")
                         console.print()
                     else:
                         console.print(f"[red]✗ Failed to update workflow via API: {api_result.get('error', 'Unknown error')}[/red]")
+                        console.print()
+                        # Try using AI to generate full workflow JSON as fallback
+                        console.print("[yellow]Attempting AI-generated workflow update...[/yellow]")
+                        ai_service = ai_analysis.get('service', 'Ollama') if isinstance(ai_analysis, dict) else 'Ollama'
+                        ai_result = generate_workflow_modifications(workflow, implementation, ai_service)
+                        if ai_result.get('success'):
+                            api_result2 = update_workflow(workflow['id'], ai_result['workflow'])
+                            if api_result2.get('success'):
+                                console.print("[green]✓ Fix applied using AI-generated workflow![/green]")
+                            else:
+                                console.print(f"[red]✗ AI-generated update also failed: {api_result2.get('error')}[/red]")
                         console.print()
                 else:
                     console.print(f"[red]✗ Could not apply fix: {fix_result.get('error', 'Unknown error')}[/red]")
@@ -1055,7 +1032,7 @@ def main():
         # Update stats based on AI analysis if available
         if not workflow.get('active'):
             inactive += 1
-        elif 'HEALTHY' in ai_status or (not ai_status and health['success_rate'] >= 90):
+        elif 'HEALTHY' in ai_status_text or (not ai_status_text and health['success_rate'] >= 90):
             healthy += 1
         else:
             needs_attention += 1
