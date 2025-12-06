@@ -82,12 +82,29 @@ def update_workflow(workflow_id, workflow_data):
         "Content-Type": "application/json"
     }
 
+    # Clean workflow data - remove read-only fields that n8n doesn't accept
+    clean_data = copy.deepcopy(workflow_data)
+    read_only_fields = ['id', 'createdAt', 'updatedAt', 'versionId', 'meta']
+    for field in read_only_fields:
+        clean_data.pop(field, None)
+
     try:
-        response = requests.put(url, headers=headers, json=workflow_data, timeout=30)
+        response = requests.put(url, headers=headers, json=clean_data, timeout=30)
         response.raise_for_status()
         return {'success': True, 'data': response.json()}
     except requests.RequestException as e:
-        return {'success': False, 'error': str(e)}
+        # Get detailed error message from n8n
+        error_msg = str(e)
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_detail = e.response.json()
+                if 'message' in error_detail:
+                    error_msg = f"{error_msg} - {error_detail['message']}"
+                elif isinstance(error_detail, dict):
+                    error_msg = f"{error_msg} - {json.dumps(error_detail)}"
+            except:
+                error_msg = f"{error_msg} - {e.response.text[:200]}"
+        return {'success': False, 'error': error_msg}
 
 
 def fetch_executions(workflow_id, limit=20):
