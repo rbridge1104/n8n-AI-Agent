@@ -32,7 +32,8 @@ def load_env():
 
 def fetch_workflows(workflow_id=None):
     """Fetch workflows from n8n API"""
-    url = f"{os.getenv('N8N_URL')}/api/v1/workflows"
+    base_url = os.getenv('N8N_URL').rstrip('/')
+    url = f"{base_url}/api/v1/workflows"
     if workflow_id:
         url += f"/{workflow_id}"
 
@@ -43,6 +44,11 @@ def fetch_workflows(workflow_id=None):
         response.raise_for_status()
         data = response.json()
         return [data] if workflow_id else data.get('data', [])
+    except json.JSONDecodeError as e:
+        console.print(f"[red]Error parsing JSON response: {e}[/red]")
+        console.print(f"[yellow]Response status: {response.status_code}[/yellow]")
+        console.print(f"[yellow]Response text: {response.text[:200]}[/yellow]")
+        return []
     except requests.RequestException as e:
         console.print(f"[red]Error fetching workflows: {e}[/red]")
         return []
@@ -50,7 +56,8 @@ def fetch_workflows(workflow_id=None):
 
 def fetch_executions(workflow_id, limit=10):
     """Fetch recent executions for a workflow"""
-    url = f"{os.getenv('N8N_URL')}/api/v1/executions"
+    base_url = os.getenv('N8N_URL').rstrip('/')
+    url = f"{base_url}/api/v1/executions"
     headers = {"X-N8N-API-KEY": os.getenv('N8N_API_KEY')}
     params = {"workflowId": workflow_id, "limit": limit}
 
@@ -58,7 +65,7 @@ def fetch_executions(workflow_id, limit=10):
         response = requests.get(url, headers=headers, params=params, timeout=10)
         response.raise_for_status()
         return response.json().get('data', [])
-    except requests.RequestException:
+    except (json.JSONDecodeError, requests.RequestException):
         return []
 
 
@@ -135,7 +142,8 @@ Be practical and concise (2-3 sentences max).
 
 Workflow JSON: {json.dumps(workflow.get('nodes', [])[:3])}"""
 
-    url = f"{os.getenv('OLLAMA_URL')}/api/generate"
+    base_url = os.getenv('OLLAMA_URL').rstrip('/')
+    url = f"{base_url}/api/generate"
     payload = {
         "model": os.getenv('OLLAMA_MODEL'),
         "prompt": prompt,
