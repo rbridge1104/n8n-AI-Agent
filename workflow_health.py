@@ -333,12 +333,14 @@ def prompt_fallback_service():
 def call_gemini_api(prompt):
     """Call Google Gemini API"""
     gemini_api_key = os.getenv('GEMINI_API_KEY')
-    gemini_model = os.getenv('GEMINI_MODEL', 'gemini-pro')
+    # Default to gemini-2.5-flash (latest fast model) or use gemini-2.5-pro for better quality
+    gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
     
     if not gemini_api_key:
         return None
     
     try:
+        # Try v1beta first
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_api_key}"
         headers = {
             "Content-Type": "application/json"
@@ -363,9 +365,31 @@ def call_gemini_api(prompt):
         
         return None
     except requests.exceptions.HTTPError as e:
+        # If v1beta fails with 404, try v1 API as fallback
+        if e.response and e.response.status_code == 404:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1/models/{gemini_model}:generateContent?key={gemini_api_key}"
+                response = requests.post(url, json=payload, headers=headers, timeout=60)
+                response.raise_for_status()
+                result = response.json()
+                
+                # Extract text from Gemini response
+                if 'candidates' in result and len(result['candidates']) > 0:
+                    content = result['candidates'][0].get('content', {})
+                    parts = content.get('parts', [])
+                    if parts and 'text' in parts[0]:
+                        return parts[0]['text']
+            except requests.RequestException:
+                pass  # Fall through to error message
+        
+        # Only show error if both attempts failed
         console.print(f"[red]Gemini API HTTP error: {e}[/red]", style="dim")
         if hasattr(e.response, 'text'):
-            console.print(f"[red]Response: {e.response.text[:200]}[/red]", style="dim")
+            error_text = e.response.text[:200]
+            console.print(f"[red]Response: {error_text}[/red]", style="dim")
+            # Suggest valid model names if model not found
+            if 'not found' in error_text.lower() or 'not supported' in error_text.lower():
+                console.print("[yellow]💡 Tip: Try setting GEMINI_MODEL to 'gemini-1.5-flash' or 'gemini-1.5-pro'[/yellow]", style="dim")
         return None
     except requests.RequestException as e:
         console.print(f"[red]Gemini API request failed: {e}[/red]", style="dim")
@@ -552,7 +576,7 @@ STATUS:
     
     elif fallback_service == 'gemini':
         # Use Gemini
-        gemini_model = os.getenv('GEMINI_MODEL', 'gemini-pro')
+        gemini_model = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
         response_text = call_gemini_api(prompt)
         if response_text:
             return {
@@ -948,7 +972,7 @@ def main():
         ai_status.append("Groq: Not configured")
     
     if gemini_api_key:
-        gemini_model = os.getenv('GEMINI_MODEL', 'gemini-pro')
+        gemini_model = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
         ai_status.append(f"Gemini: {gemini_model}")
     else:
         ai_status.append("Gemini: Not configured")
