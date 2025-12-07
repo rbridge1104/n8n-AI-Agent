@@ -17,6 +17,139 @@ from rich.text import Text
 
 console = Console()
 
+# Store selected AI service
+_selected_ai_service = None
+
+
+def test_ollama():
+    """Test if Ollama is available and working"""
+    ollama_url = os.getenv('OLLAMA_URL', 'http://localhost:11434')
+    ollama_model = os.getenv('OLLAMA_MODEL')
+
+    if not ollama_model:
+        return False, "OLLAMA_MODEL not configured"
+
+    try:
+        url = f"{ollama_url.rstrip('/')}/api/generate"
+        response = requests.post(url, json={"model": ollama_model, "prompt": "test", "stream": False}, timeout=5)
+        if response.status_code == 200:
+            return True, f"Ollama ({ollama_model})"
+        return False, f"HTTP {response.status_code}"
+    except requests.exceptions.ConnectionError:
+        return False, "Connection failed (is Ollama running?)"
+    except requests.exceptions.Timeout:
+        return False, "Timeout"
+    except Exception as e:
+        return False, str(e)
+
+
+def test_groq():
+    """Test if Groq is available and working"""
+    groq_api_key = os.getenv('GROQ_API_KEY')
+    groq_model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
+
+    if not groq_api_key:
+        return False, "GROQ_API_KEY not configured"
+
+    try:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {groq_api_key}", "Content-Type": "application/json"}
+        response = requests.post(url, json={"model": groq_model, "messages": [{"role": "user", "content": "test"}], "max_tokens": 5}, headers=headers, timeout=10)
+        if response.status_code == 200:
+            return True, f"Groq ({groq_model})"
+        return False, f"HTTP {response.status_code}"
+    except Exception as e:
+        return False, str(e)
+
+
+def test_gemini():
+    """Test if Gemini is available and working"""
+    gemini_api_key = os.getenv('GEMINI_API_KEY')
+    gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+
+    if not gemini_api_key:
+        return False, "GEMINI_API_KEY not configured"
+
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_api_key}"
+        response = requests.post(url, json={"contents": [{"parts": [{"text": "test"}]}]}, timeout=10)
+        if response.status_code == 200:
+            return True, f"Gemini ({gemini_model})"
+        return False, f"HTTP {response.status_code}"
+    except Exception as e:
+        return False, str(e)
+
+
+def select_ai_service():
+    """Test available AI services and let user select one"""
+    global _selected_ai_service
+
+    console.print("[cyan]Testing AI services...[/cyan]")
+    console.print()
+
+    # Test all services
+    services = {
+        'ollama': test_ollama(),
+        'groq': test_groq(),
+        'gemini': test_gemini()
+    }
+
+    # Filter to available services
+    available = {name: info for name, (is_available, info) in services.items() if is_available}
+
+    # Display results
+    for name, (is_available, info) in services.items():
+        status = "✓" if is_available else "✗"
+        color = "green" if is_available else "red"
+        console.print(f"  [{color}]{status} {name.capitalize()}: {info}[/{color}]")
+
+    console.print()
+
+    # Handle no services available
+    if not available:
+        console.print("[red]Error: No AI services are available![/red]")
+        console.print()
+        console.print("[yellow]Please configure at least one AI service:[/yellow]")
+        console.print("[yellow]  • Ollama: Set OLLAMA_URL and OLLAMA_MODEL in .env[/yellow]")
+        console.print("[yellow]  • Groq: Set GROQ_API_KEY in .env[/yellow]")
+        console.print("[yellow]  • Gemini: Set GEMINI_API_KEY in .env[/yellow]")
+        console.print()
+        console.print("[dim]Check .env.example for configuration format[/dim]")
+        sys.exit(1)
+
+    # If only one service available, use it automatically
+    if len(available) == 1:
+        service_name = list(available.keys())[0]
+        _selected_ai_service = service_name
+        console.print(f"[green]Using {service_name.capitalize()} (only available service)[/green]")
+        console.print()
+        return service_name
+
+    # Multiple services available - let user choose
+    console.print("[cyan]Multiple AI services are available. Which would you like to use?[/cyan]")
+    service_list = list(available.keys())
+    for i, name in enumerate(service_list, 1):
+        console.print(f"  {i}. {name.capitalize()} - {available[name]}")
+    console.print()
+
+    while True:
+        try:
+            choice = input(f"Enter choice (1-{len(service_list)}): ").strip()
+            choice_num = int(choice)
+            if 1 <= choice_num <= len(service_list):
+                selected = service_list[choice_num - 1]
+                _selected_ai_service = selected
+                console.print(f"[green]Using {selected.capitalize()}[/green]")
+                console.print()
+                return selected
+            else:
+                console.print(f"[red]Invalid choice. Please enter 1-{len(service_list)}[/red]")
+        except ValueError:
+            console.print("[red]Invalid input. Please enter a number.[/red]")
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[yellow]Cancelled.[/yellow]")
+            sys.exit(0)
+
 
 def load_env():
     """Load environment variables from .env file"""
@@ -29,16 +162,6 @@ def load_env():
     if missing:
         console.print(f"[red]Error: Missing required environment variables: {', '.join(missing)}[/red]")
         console.print("[yellow]Copy .env.example to .env and fill in your credentials[/yellow]")
-        sys.exit(1)
-
-    # At least one AI service required (Ollama or Groq)
-    has_ollama = os.getenv('OLLAMA_URL') and os.getenv('OLLAMA_MODEL')
-    has_groq = os.getenv('GROQ_API_KEY')
-
-    if not has_ollama and not has_groq:
-        console.print("[red]Error: At least one AI service must be configured:[/red]")
-        console.print("[yellow]  - Ollama (OLLAMA_URL + OLLAMA_MODEL), or[/yellow]")
-        console.print("[yellow]  - Groq (GROQ_API_KEY)[/yellow]")
         sys.exit(1)
 
 
@@ -278,7 +401,8 @@ def time_ago(timestamp_str):
 
 
 def ask_ollama(workflow, health, structure):
-    """Ask Ollama (or Groq/Gemini fallback) for comprehensive workflow analysis with implementation plan"""
+    """Ask selected AI service for comprehensive workflow analysis with implementation plan"""
+    global _selected_ai_service
     active_status = "active" if workflow.get('active') else "inactive"
     
     # Build workflow structure section
@@ -353,76 +477,43 @@ IMPLEMENTATION:
 STATUS:
 [HEALTHY/NEEDS ATTENTION/BROKEN/INCOMPLETE]"""
 
-    # Try Ollama first
-    ollama_url = os.getenv('OLLAMA_URL')
-    ollama_model = os.getenv('OLLAMA_MODEL')
-    
-    # Default to localhost if OLLAMA_URL not set
-    if not ollama_url:
-        ollama_url = 'http://localhost:11434'
-    
-    if ollama_url and ollama_model:
-        try:
-            base_url = ollama_url.rstrip('/')
-            url = f"{base_url}/api/generate"
-            payload = {
-                "model": ollama_model,
-                "prompt": prompt,
-                "stream": False
-            }
-            response = requests.post(url, json=payload, timeout=60)
+    # Use the selected AI service
+    try:
+        if _selected_ai_service == 'ollama':
+            ollama_url = os.getenv('OLLAMA_URL', 'http://localhost:11434')
+            ollama_model = os.getenv('OLLAMA_MODEL')
+
+            url = f"{ollama_url.rstrip('/')}/api/generate"
+            response = requests.post(url, json={"model": ollama_model, "prompt": prompt, "stream": False}, timeout=60)
             response.raise_for_status()
-            response_text = response.json().get('response', 'Unable to generate suggestion')
             return {
-                'response': response_text,
+                'response': response.json().get('response', 'Unable to generate suggestion'),
                 'service': 'Ollama',
                 'model': ollama_model
             }
-        except requests.RequestException:
-            pass  # Fall through to Groq/Gemini
 
-    # Fallback to Groq if Ollama fails
-    groq_api_key = os.getenv('GROQ_API_KEY')
-    groq_model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
-    if groq_api_key:
-        try:
+        elif _selected_ai_service == 'groq':
+            groq_api_key = os.getenv('GROQ_API_KEY')
+            groq_model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
+
             url = "https://api.groq.com/openai/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {groq_api_key}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": groq_model,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.7,
-                "max_tokens": 1500
-            }
+            headers = {"Authorization": f"Bearer {groq_api_key}", "Content-Type": "application/json"}
+            payload = {"model": groq_model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.7, "max_tokens": 1500}
             response = requests.post(url, json=payload, headers=headers, timeout=60)
             response.raise_for_status()
-            response_text = response.json()['choices'][0]['message']['content']
             return {
-                'response': response_text,
+                'response': response.json()['choices'][0]['message']['content'],
                 'service': 'Groq',
                 'model': groq_model
             }
-        except requests.RequestException:
-            pass
 
-    # Fallback to Gemini
-    gemini_api_key = os.getenv('GEMINI_API_KEY')
-    gemini_model = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
-    if gemini_api_key:
-        try:
+        elif _selected_ai_service == 'gemini':
+            gemini_api_key = os.getenv('GEMINI_API_KEY')
+            gemini_model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_api_key}"
-            headers = {"Content-Type": "application/json"}
-            payload = {
-                "contents": [{
-                    "parts": [{"text": prompt}]
-                }]
-            }
-            response = requests.post(url, json=payload, headers=headers, timeout=60)
+            payload = {"contents": [{"parts": [{"text": prompt}]}]}
+            response = requests.post(url, json=payload, timeout=60)
             response.raise_for_status()
             result = response.json()
             if 'candidates' in result and len(result['candidates']) > 0:
@@ -434,12 +525,17 @@ STATUS:
                         'service': 'Gemini',
                         'model': gemini_model
                     }
-        except requests.RequestException:
-            pass
+
+    except requests.RequestException as e:
+        return {
+            'response': f"AI service error: {str(e)}",
+            'service': _selected_ai_service or 'None',
+            'model': 'N/A'
+        }
 
     return {
-        'response': "Unable to connect to AI service (tried Ollama, Groq, and Gemini)",
-        'service': 'None',
+        'response': "Unable to get AI response",
+        'service': _selected_ai_service or 'None',
         'model': 'N/A'
     }
 
@@ -941,33 +1037,10 @@ def main():
 
     # Display header
     console.print(Panel("Workflow Health Report", style="bold magenta"))
-    
-    # Show AI service configuration
-    ollama_url = os.getenv('OLLAMA_URL', 'http://localhost:11434')
-    ollama_model = os.getenv('OLLAMA_MODEL')
-    groq_api_key = os.getenv('GROQ_API_KEY')
-    gemini_api_key = os.getenv('GEMINI_API_KEY')
-    
-    ai_status = []
-    if ollama_model:
-        ai_status.append(f"Ollama: {ollama_url} ({ollama_model})")
-    else:
-        ai_status.append("Ollama: Not configured (OLLAMA_MODEL missing)")
-    
-    if groq_api_key:
-        groq_model = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
-        ai_status.append(f"Groq: {groq_model}")
-    else:
-        ai_status.append("Groq: Not configured")
-    
-    if gemini_api_key:
-        gemini_model = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
-        ai_status.append(f"Gemini: {gemini_model}")
-    else:
-        ai_status.append("Gemini: Not configured")
-    
-    console.print(f"[dim]AI Services: {' | '.join(ai_status)}[/dim]")
     console.print()
+
+    # Test and select AI service
+    select_ai_service()
 
     # Fetch workflows
     workflows = fetch_workflows(workflow_id)
