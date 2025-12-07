@@ -8,6 +8,7 @@ import sys
 import os
 import json
 import copy
+import time
 from datetime import datetime, timezone
 import requests
 from dotenv import load_dotenv
@@ -124,14 +125,14 @@ def test_ollama():
 
     try:
         url = f"{ollama_url.rstrip('/')}/api/generate"
-        response = requests.post(url, json={"model": ollama_model, "prompt": "test", "stream": False}, timeout=30)
+        response = requests.post(url, json={"model": ollama_model, "prompt": "test", "stream": False}, timeout=120)
         if response.status_code == 200:
             return True, f"Ollama ({ollama_model})"
         return False, f"HTTP {response.status_code}"
     except requests.exceptions.ConnectionError:
         return False, "Connection failed (is Ollama running?)"
     except requests.exceptions.Timeout:
-        return False, "Timeout (>30s)"
+        return False, "Timeout (>120s)"
     except Exception as e:
         return False, str(e)
 
@@ -302,26 +303,9 @@ def update_workflow(workflow_id, workflow_data, original_workflow=None):
     
     # Clean the workflow data using our strict cleaning function
     clean_data, error = clean_workflow_for_api(workflow_data, original_workflow)
-    
+
     if error:
         return {'success': False, 'error': error}
-
-    # Debug: Show what we're sending
-    console.print("[dim]Debug: Sending fields to n8n API:[/dim]", style="dim")
-    console.print(f"[dim]  - Root fields: {list(clean_data.keys())}[/dim]", style="dim")
-    if 'settings' in clean_data:
-        console.print(f"[dim]  - Settings fields: {list(clean_data['settings'].keys())}[/dim]", style="dim")
-    if 'nodes' in clean_data and len(clean_data['nodes']) > 0:
-        sample_node = clean_data['nodes'][0]
-        console.print(f"[dim]  - Sample node fields: {list(sample_node.keys())}[/dim]", style="dim")
-
-    # Save to file for inspection
-    try:
-        with open('debug_workflow_update.json', 'w') as f:
-            json.dump(clean_data, f, indent=2)
-        console.print("[dim]  - Full data saved to debug_workflow_update.json[/dim]", style="dim")
-    except:
-        pass
 
     try:
         response = requests.put(url, headers=headers, json=clean_data, timeout=30)
@@ -551,9 +535,9 @@ STATUS:
             ollama_url = os.getenv('OLLAMA_URL', 'http://localhost:11434')
             ollama_model = os.getenv('OLLAMA_MODEL')
 
-            console.print("[dim]Analyzing workflow with Ollama (this may take 2-10 minutes for local models)...[/dim]")
+            console.print("[dim]Analyzing workflow with Ollama (this may take 5-30 minutes for local models)...[/dim]")
             url = f"{ollama_url.rstrip('/')}/api/generate"
-            response = requests.post(url, json={"model": ollama_model, "prompt": prompt, "stream": False}, timeout=900)
+            response = requests.post(url, json={"model": ollama_model, "prompt": prompt, "stream": False}, timeout=3600)
             response.raise_for_status()
             return {
                 'response': response.json().get('response', 'Unable to generate suggestion'),
@@ -771,6 +755,54 @@ def apply_workflow_fix(workflow, implementation):
         return {'success': False, 'error': error}
     
     return {'success': True, 'workflow': clean_workflow}
+
+
+def rerun_health_check(workflow_id, original_health, original_workflow_name):
+    """Rerun health check on an updated workflow"""
+    console.print("[cyan]Rerunning health check on updated workflow...[/cyan]")
+    console.print()
+    
+    # Fetch updated workflow
+    updated_workflows = fetch_workflows(workflow_id)
+    if not updated_workflows or len(updated_workflows) == 0:
+        console.print("[yellow]Could not fetch updated workflow for re-check[/yellow]")
+        return
+    
+    updated_workflow = updated_workflows[0]
+    
+    # Brief pause to allow workflow to update
+    time.sleep(1)
+    
+    # Get fresh executions
+    fresh_executions = fetch_executions(workflow_id, limit=20)
+    fresh_health = calculate_health(updated_workflow, fresh_executions)
+    fresh_structure = analyze_workflow_structure(updated_workflow)
+    
+    # Get updated AI analysis
+    fresh_ai_analysis = ask_ollama(updated_workflow, fresh_health, fresh_structure)
+    
+    # Display updated health
+    console.print(Panel(
+        f"[bold green]Updated Health Check: {updated_workflow.get('name', original_workflow_name)}[/bold green]",
+        style="green"
+    ))
+    console.print()
+    
+    fresh_parsed = display_workflow_health(updated_workflow, fresh_health, fresh_ai_analysis)
+    
+    # Show improvement if any
+    old_rate = original_health['success_rate']
+    new_rate = fresh_health['success_rate']
+    if new_rate > old_rate:
+        improvement = new_rate - old_rate
+        console.print(f"[green]📈 Success rate improved by {improvement:.1f}%![/green]")
+    elif new_rate == old_rate and new_rate == 100:
+        console.print("[green]✓ Workflow is now at 100% success rate![/green]")
+    elif new_rate < old_rate:
+        console.print(f"[yellow]⚠️  Success rate decreased by {old_rate - new_rate:.1f}% - monitor closely[/yellow]")
+    console.print()
+    
+    return fresh_parsed, fresh_health
 
 
 def prompt_for_approval(workflow, quick_fix, implementation):
@@ -1004,6 +1036,9 @@ def main():
                     if api_result.get('success'):
                         console.print("[green]✓ Fix applied successfully![/green]")
                         console.print()
+                        
+                        # Rerun health check on updated workflow
+                        rerun_health_check(workflow['id'], health, workflow.get('name', 'Unknown'))
                     else:
                         console.print(f"[red]✗ Failed to update workflow via API: {api_result.get('error', 'Unknown error')}[/red]")
                         console.print()
