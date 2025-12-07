@@ -20,6 +20,99 @@ console = Console()
 # Store selected AI service
 _selected_ai_service = None
 
+# n8n API allowed fields - CRITICAL: only these fields are accepted
+# Root level allowed fields for workflow update
+ALLOWED_WORKFLOW_FIELDS = ['name', 'nodes', 'connections', 'settings', 'staticData', 'pinData']
+
+# Settings object allowed fields (n8n API is very strict about this!)
+# Based on n8n API documentation and community findings
+ALLOWED_SETTINGS_FIELDS = [
+    'executionOrder',     # v0 or v1
+    'saveDataErrorExecution',
+    'saveDataSuccessExecution', 
+    'saveManualExecutions',
+    'saveExecutionProgress',
+    'executionTimeout',
+    'errorWorkflow',
+    'timezone',
+    'callerPolicy',       # Note: Some versions may not accept this via API
+]
+
+
+def clean_workflow_for_api(workflow_data, original_workflow=None):
+    """
+    Clean workflow data to only include fields accepted by n8n API.
+    This is critical because n8n API returns 400 Bad Request for any extra fields.
+    """
+    clean_data = {}
+    
+    # 1. Handle name (required)
+    if 'name' in workflow_data:
+        clean_data['name'] = workflow_data['name']
+    elif original_workflow and 'name' in original_workflow:
+        clean_data['name'] = original_workflow['name']
+    else:
+        return None, "Workflow name is required but missing"
+    
+    # 2. Handle nodes
+    if 'nodes' in workflow_data:
+        clean_nodes = []
+        for node in workflow_data['nodes']:
+            clean_node = {}
+            # Only include allowed node fields
+            node_allowed_fields = [
+                'parameters', 'type', 'typeVersion', 'position', 'name',
+                'credentials', 'disabled', 'notes', 'notesInFlow',
+                'retryOnFail', 'maxTries', 'waitBetweenTries', 'alwaysOutputData',
+                'executeOnce', 'onError', 'continueOnFail'
+            ]
+            for field in node_allowed_fields:
+                if field in node:
+                    clean_node[field] = node[field]
+            
+            # Clean credentials - only keep id and name
+            if 'credentials' in clean_node and isinstance(clean_node['credentials'], dict):
+                cleaned_creds = {}
+                for cred_type, cred_data in clean_node['credentials'].items():
+                    if isinstance(cred_data, dict):
+                        cleaned_creds[cred_type] = {
+                            'id': cred_data.get('id'),
+                            'name': cred_data.get('name')
+                        }
+                    else:
+                        cleaned_creds[cred_type] = cred_data
+                clean_node['credentials'] = cleaned_creds
+            
+            clean_nodes.append(clean_node)
+        clean_data['nodes'] = clean_nodes
+    
+    # 3. Handle connections (required)
+    if 'connections' in workflow_data:
+        clean_data['connections'] = workflow_data['connections']
+    elif original_workflow and 'connections' in original_workflow:
+        clean_data['connections'] = original_workflow['connections']
+    else:
+        clean_data['connections'] = {}
+    
+    # 4. Handle settings - CRITICAL: only include allowed settings fields
+    if 'settings' in workflow_data and workflow_data['settings']:
+        clean_settings = {}
+        for field in ALLOWED_SETTINGS_FIELDS:
+            if field in workflow_data['settings']:
+                clean_settings[field] = workflow_data['settings'][field]
+        if clean_settings:
+            clean_data['settings'] = clean_settings
+    
+    # 5. Handle staticData (optional)
+    if 'staticData' in workflow_data and workflow_data['staticData']:
+        clean_data['staticData'] = workflow_data['staticData']
+    
+    # 6. Handle pinData (optional)  
+    if 'pinData' in workflow_data and workflow_data['pinData']:
+        clean_data['pinData'] = workflow_data['pinData']
+    
+    return clean_data, None
+
 
 def test_ollama():
     """Test if Ollama is available and working"""
@@ -31,14 +124,14 @@ def test_ollama():
 
     try:
         url = f"{ollama_url.rstrip('/')}/api/generate"
-        response = requests.post(url, json={"model": ollama_model, "prompt": "test", "stream": False}, timeout=5)
+        response = requests.post(url, json={"model": ollama_model, "prompt": "test", "stream": False}, timeout=30)
         if response.status_code == 200:
             return True, f"Ollama ({ollama_model})"
         return False, f"HTTP {response.status_code}"
     except requests.exceptions.ConnectionError:
         return False, "Connection failed (is Ollama running?)"
     except requests.exceptions.Timeout:
-        return False, "Timeout"
+        return False, "Timeout (>30s)"
     except Exception as e:
         return False, str(e)
 
@@ -189,7 +282,7 @@ def fetch_workflows(workflow_id=None):
         return []
 
 
-def update_workflow(workflow_id, workflow_data):
+def update_workflow(workflow_id, workflow_data, original_workflow=None):
     """Update a workflow via n8n API"""
     base_url = os.getenv('N8N_URL').rstrip('/')
     url = f"{base_url}/api/v1/workflows/{workflow_id}"
@@ -198,52 +291,26 @@ def update_workflow(workflow_id, workflow_data):
         "Content-Type": "application/json"
     }
 
-    # n8n API only accepts specific fields for workflow updates
-    # Only include fields that are allowed by the API
-    allowed_fields = ['name', 'nodes', 'connections', 'active', 'settings', 'staticData', 'tags', 'pinData']
-    clean_data = {}
-    
-    # Name is required - ensure it's included
-    if 'name' not in workflow_data:
-        # Try to get name from original workflow if available
-        console.print("[yellow]Warning: 'name' field missing, attempting to fetch from workflow...[/yellow]")
+    # If we don't have the original workflow, fetch it
+    if original_workflow is None:
         try:
-            original = fetch_workflows(workflow_id)
-            if original and len(original) > 0:
-                workflow_data['name'] = original[0].get('name', 'Untitled Workflow')
+            originals = fetch_workflows(workflow_id)
+            if originals and len(originals) > 0:
+                original_workflow = originals[0]
         except:
-            workflow_data['name'] = 'Untitled Workflow'
+            pass
     
-    for field in allowed_fields:
-        if field in workflow_data:
-            clean_data[field] = workflow_data[field]
+    # Clean the workflow data using our strict cleaning function
+    clean_data, error = clean_workflow_for_api(workflow_data, original_workflow)
     
-    # Ensure name is always present (required by API)
-    if 'name' not in clean_data:
-        return {'success': False, 'error': 'Workflow name is required but was not provided'}
-    
-    # Clean nodes - remove read-only fields that cause API errors
-    if 'nodes' in clean_data:
-        for node in clean_data['nodes']:
-            # Remove read-only fields
-            for field in ['id', 'createdAt', 'updatedAt', 'versionId', 'meta', 'webhookId']:
-                node.pop(field, None)
-            # Clean credentials to only include id and name
-            if 'credentials' in node and isinstance(node['credentials'], dict):
-                cleaned_creds = {}
-                for cred_type, cred_data in node['credentials'].items():
-                    if isinstance(cred_data, dict):
-                        cleaned_creds[cred_type] = {
-                            'id': cred_data.get('id'),
-                            'name': cred_data.get('name')
-                        }
-                    else:
-                        cleaned_creds[cred_type] = cred_data
-                node['credentials'] = cleaned_creds
+    if error:
+        return {'success': False, 'error': error}
 
-    # Debug: Show what we're sending (temporarily)
+    # Debug: Show what we're sending
     console.print("[dim]Debug: Sending fields to n8n API:[/dim]", style="dim")
-    console.print(f"[dim]  - Fields: {list(clean_data.keys())}[/dim]", style="dim")
+    console.print(f"[dim]  - Root fields: {list(clean_data.keys())}[/dim]", style="dim")
+    if 'settings' in clean_data:
+        console.print(f"[dim]  - Settings fields: {list(clean_data['settings'].keys())}[/dim]", style="dim")
     if 'nodes' in clean_data and len(clean_data['nodes']) > 0:
         sample_node = clean_data['nodes'][0]
         console.print(f"[dim]  - Sample node fields: {list(sample_node.keys())}[/dim]", style="dim")
@@ -306,6 +373,7 @@ def analyze_workflow_structure(workflow):
     
     # Check for retry logic (nodes with retryOnFail or retry settings)
     has_retry_logic = any(
+        node.get('retryOnFail') or 
         node.get('parameters', {}).get('retryOnFail') or 
         node.get('parameters', {}).get('retry') 
         for node in nodes
@@ -483,8 +551,9 @@ STATUS:
             ollama_url = os.getenv('OLLAMA_URL', 'http://localhost:11434')
             ollama_model = os.getenv('OLLAMA_MODEL')
 
+            console.print("[dim]Analyzing workflow with Ollama (this may take 2-10 minutes for local models)...[/dim]")
             url = f"{ollama_url.rstrip('/')}/api/generate"
-            response = requests.post(url, json={"model": ollama_model, "prompt": prompt, "stream": False}, timeout=60)
+            response = requests.post(url, json={"model": ollama_model, "prompt": prompt, "stream": False}, timeout=900)
             response.raise_for_status()
             return {
                 'response': response.json().get('response', 'Unable to generate suggestion'),
@@ -608,129 +677,8 @@ def parse_ai_response(response_text):
     return result
 
 
-def generate_workflow_modifications(workflow, implementation, ai_service='Ollama'):
-    """Use AI to generate actual workflow JSON modifications based on implementation plan"""
-    if not implementation or 'action' not in implementation:
-        return {'success': False, 'error': 'No implementation provided'}
-    
-    action = implementation.get('action', '')
-    details = implementation.get('details', {})
-    
-    prompt = f"""You are an n8n workflow expert. Generate the exact JSON modifications needed to implement this change:
-
-Action: {action}
-Details: {json.dumps(details, indent=2)}
-
-Current Workflow JSON:
-{json.dumps(workflow, indent=2)}
-
-Generate the MODIFIED workflow JSON with ONLY the changes needed. Return ONLY valid JSON that can be used to update the workflow via n8n API.
-
-Important:
-- Only include fields allowed by n8n API: name, nodes, connections, active, settings, staticData, tags, pinData
-- Do NOT include read-only fields: id, createdAt, updatedAt, versionId, meta
-- Preserve all existing nodes and connections unless explicitly changing them
-- Make minimal changes - only what's needed for the implementation
-
-Return ONLY the JSON object, no explanation."""
-
-    # Use the same AI service that was used for analysis
-    ollama_url = os.getenv('OLLAMA_URL', 'http://localhost:11434')
-    ollama_model = os.getenv('OLLAMA_MODEL')
-    
-    if ai_service == 'Ollama' and ollama_model:
-        try:
-            base_url = ollama_url.rstrip('/')
-            url = f"{base_url}/api/generate"
-            payload = {
-                "model": ollama_model,
-                "prompt": prompt,
-                "stream": False
-            }
-            response = requests.post(url, json=payload, timeout=90)
-            response.raise_for_status()
-            response_text = response.json().get('response', '')
-        except requests.RequestException:
-            response_text = None
-    else:
-        response_text = None
-    
-    # Fallback to Groq
-    if not response_text:
-        groq_api_key = os.getenv('GROQ_API_KEY')
-        if groq_api_key:
-            try:
-                url = "https://api.groq.com/openai/v1/chat/completions"
-                headers = {
-                    "Authorization": f"Bearer {groq_api_key}",
-                    "Content-Type": "application/json"
-                }
-                payload = {
-                    "model": os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile'),
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3,  # Lower temperature for more precise JSON
-                    "max_tokens": 4000
-                }
-                response = requests.post(url, json=payload, headers=headers, timeout=90)
-                response.raise_for_status()
-                response_text = response.json()['choices'][0]['message']['content']
-            except requests.RequestException:
-                return {'success': False, 'error': 'Failed to connect to AI service'}
-    
-    # Try to extract JSON from response
-    try:
-        # Try to find JSON in the response
-        json_start = response_text.find('{')
-        if json_start >= 0:
-            json_end = response_text.rfind('}') + 1
-            if json_end > json_start:
-                json_str = response_text[json_start:json_end]
-                modified_workflow = json.loads(json_str)
-                
-                # Clean the workflow - ensure it has required fields and only allowed fields
-                allowed_fields = ['name', 'nodes', 'connections', 'active', 'settings', 'staticData', 'tags', 'pinData']
-                clean_workflow = {}
-                
-                # Always include name (required by API) - use original if AI didn't include it
-                if 'name' in modified_workflow:
-                    clean_workflow['name'] = modified_workflow['name']
-                elif workflow.get('name'):
-                    clean_workflow['name'] = workflow['name']
-                else:
-                    return {'success': False, 'error': 'Workflow name is required but missing'}
-                
-                # Include other allowed fields if they exist in AI response
-                for field in allowed_fields:
-                    if field != 'name' and field in modified_workflow:
-                        clean_workflow[field] = modified_workflow[field]
-                
-                # Clean nodes - remove read-only fields
-                if 'nodes' in clean_workflow:
-                    for node in clean_workflow['nodes']:
-                        for field in ['id', 'createdAt', 'updatedAt', 'versionId', 'meta', 'webhookId']:
-                            node.pop(field, None)
-                        # Clean credentials
-                        if 'credentials' in node and isinstance(node['credentials'], dict):
-                            cleaned_creds = {}
-                            for cred_type, cred_data in node['credentials'].items():
-                                if isinstance(cred_data, dict):
-                                    cleaned_creds[cred_type] = {
-                                        'id': cred_data.get('id'),
-                                        'name': cred_data.get('name')
-                                    }
-                                else:
-                                    cleaned_creds[cred_type] = cred_data
-                            node['credentials'] = cleaned_creds
-                
-                return {'success': True, 'workflow': clean_workflow}
-    except (json.JSONDecodeError, ValueError) as e:
-        return {'success': False, 'error': f'Failed to parse AI response as JSON: {str(e)}'}
-    
-    return {'success': False, 'error': 'No valid JSON found in AI response'}
-
-
 def apply_workflow_fix(workflow, implementation):
-    """Apply AI-suggested fix directly to workflow JSON (simpler approach)"""
+    """Apply AI-suggested fix directly to workflow JSON"""
     if not implementation or 'action' not in implementation:
         return {'success': False, 'error': 'No implementation provided'}
 
@@ -809,48 +757,18 @@ def apply_workflow_fix(workflow, implementation):
         if 'settings' not in updated_workflow:
             updated_workflow['settings'] = {}
         
+        # Only apply settings that are allowed by the API
         for key, value in settings.items():
-            updated_workflow['settings'][key] = value
+            if key in ALLOWED_SETTINGS_FIELDS:
+                updated_workflow['settings'][key] = value
+            else:
+                console.print(f"[yellow]Warning: Skipping settings field '{key}' - not allowed by n8n API[/yellow]")
     
-    # Clean the workflow data for API - only include allowed fields
-    allowed_fields = ['name', 'nodes', 'connections', 'active', 'settings', 'staticData', 'tags', 'pinData']
-    clean_workflow = {}
+    # Use our strict cleaning function to prepare for API
+    clean_workflow, error = clean_workflow_for_api(updated_workflow, workflow)
     
-    # Always include name (required by API)
-    if 'name' in updated_workflow:
-        clean_workflow['name'] = updated_workflow['name']
-    elif workflow.get('name'):
-        clean_workflow['name'] = workflow['name']
-    else:
-        return {'success': False, 'error': 'Workflow name is required but missing'}
-    
-    # Include other allowed fields if they exist
-    for field in allowed_fields:
-        if field != 'name' and field in updated_workflow:
-            clean_workflow[field] = updated_workflow[field]
-    
-    # Clean nodes - remove read-only fields
-    if 'nodes' in clean_workflow:
-        for node in clean_workflow['nodes']:
-            # Remove read-only fields that cause API errors
-            for field in ['id', 'createdAt', 'updatedAt', 'versionId', 'meta', 'webhookId']:
-                node.pop(field, None)
-            # Also clean credentials if present (they're stored separately)
-            if 'credentials' in node:
-                # Keep credentials but ensure they're in the right format
-                creds = node['credentials']
-                if isinstance(creds, dict):
-                    # Keep only id and name for credentials
-                    cleaned_creds = {}
-                    for cred_type, cred_data in creds.items():
-                        if isinstance(cred_data, dict):
-                            cleaned_creds[cred_type] = {
-                                'id': cred_data.get('id'),
-                                'name': cred_data.get('name')
-                            }
-                        else:
-                            cleaned_creds[cred_type] = cred_data
-                    node['credentials'] = cleaned_creds
+    if error:
+        return {'success': False, 'error': error}
     
     return {'success': True, 'workflow': clean_workflow}
 
@@ -895,7 +813,9 @@ def prompt_for_approval(workflow, quick_fix, implementation):
         changes = details.get('changes', {})
         if changes:
             for key, value in changes.items():
-                console.print(f"    - {key}: {value}")
+                allowed = key in ALLOWED_SETTINGS_FIELDS
+                status = "[green]✓[/green]" if allowed else "[red]✗ (not allowed by API)[/red]"
+                console.print(f"    - {key}: {value} {status}")
     else:
         console.print(f"  • Action: {action}")
     
@@ -1079,24 +999,13 @@ def main():
                     updated_workflow = fix_result.get('workflow')
                     
                     # Update workflow via API
-                    api_result = update_workflow(workflow['id'], updated_workflow)
+                    api_result = update_workflow(workflow['id'], updated_workflow, workflow)
                     
                     if api_result.get('success'):
                         console.print("[green]✓ Fix applied successfully![/green]")
                         console.print()
                     else:
                         console.print(f"[red]✗ Failed to update workflow via API: {api_result.get('error', 'Unknown error')}[/red]")
-                        console.print()
-                        # Try using AI to generate full workflow JSON as fallback
-                        console.print("[yellow]Attempting AI-generated workflow update...[/yellow]")
-                        ai_service = ai_analysis.get('service', 'Ollama') if isinstance(ai_analysis, dict) else 'Ollama'
-                        ai_result = generate_workflow_modifications(workflow, implementation, ai_service)
-                        if ai_result.get('success'):
-                            api_result2 = update_workflow(workflow['id'], ai_result['workflow'])
-                            if api_result2.get('success'):
-                                console.print("[green]✓ Fix applied using AI-generated workflow![/green]")
-                            else:
-                                console.print(f"[red]✗ AI-generated update also failed: {api_result2.get('error')}[/red]")
                         console.print()
                 else:
                     console.print(f"[red]✗ Could not apply fix: {fix_result.get('error', 'Unknown error')}[/red]")
